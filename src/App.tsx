@@ -727,41 +727,55 @@ function App() {
 
   async function generateTitleOptions() {
     setOutputStatus(null)
-    const response = await withBusy('titles', () =>
-      requestJson<{ titles: TitleOption[]; selectedTitlePromptId: number | null }>('/api/generate/titles', {
-        method: 'POST',
-        body: JSON.stringify({ direction, titlePromptId, keyword, productId }),
-      }),
-    )
-    setTitles(response.titles)
-    setSelectedTitle(response.titles[0] ?? null)
-    setTitlePromptId(response.selectedTitlePromptId ?? titlePromptId)
-    setArticlePromptId(filteredArticlePrompts[0]?.id ?? null)
-    setLatestRecord(null)
-    setBatchResults([])
-    setNotice({ type: 'success', text: '已生成 3 组标题候选。' })
+    setNotice({ type: 'info', text: '正在生成标题候选，请等待模型返回结果...' })
+    try {
+      const response = await withBusy('titles', () =>
+        requestJson<{ titles: TitleOption[]; selectedTitlePromptId: number | null }>('/api/generate/titles', {
+          method: 'POST',
+          body: JSON.stringify({ direction, titlePromptId, keyword, productId }),
+        }),
+      )
+      setTitles(response.titles)
+      setSelectedTitle(response.titles[0] ?? null)
+      setTitlePromptId(response.selectedTitlePromptId ?? titlePromptId)
+      setArticlePromptId(filteredArticlePrompts[0]?.id ?? null)
+      setLatestRecord(null)
+      setBatchResults([])
+      setNotice({ type: 'success', text: '已生成 4 组标题候选。' })
+    } catch (error) {
+      setTitles([])
+      setSelectedTitle(null)
+      setLatestRecord(null)
+      setBatchResults([])
+      setNotice({ type: 'error', text: `标题生成失败：${getErrorMessage(error)}` })
+    }
   }
 
   async function refreshSingleTitle(index: number) {
-    const response = await withBusy('titles', () =>
-      requestJson<{ titles: TitleOption[]; selectedTitlePromptId: number | null }>('/api/generate/titles', {
-        method: 'POST',
-        body: JSON.stringify({ direction, titlePromptId, keyword, productId }),
-      }),
-    )
-    const replacement = response.titles[0]
-    if (!replacement) {
-      return
+    setNotice({ type: 'info', text: '正在刷新单个标题，请等待模型返回结果...' })
+    try {
+      const response = await withBusy('titles', () =>
+        requestJson<{ titles: TitleOption[]; selectedTitlePromptId: number | null }>('/api/generate/titles', {
+          method: 'POST',
+          body: JSON.stringify({ direction, titlePromptId, keyword, productId }),
+        }),
+      )
+      const replacement = response.titles[0]
+      if (!replacement) {
+        return
+      }
+      setTitles((current) => {
+        const next = [...current]
+        next[index] = replacement
+        return next
+      })
+      if (selectedTitle && titles[index]?.zh === selectedTitle.zh) {
+        setSelectedTitle(replacement)
+      }
+      setNotice({ type: 'info', text: '单个标题已刷新。' })
+    } catch (error) {
+      setNotice({ type: 'error', text: `标题刷新失败：${getErrorMessage(error)}` })
     }
-    setTitles((current) => {
-      const next = [...current]
-      next[index] = replacement
-      return next
-    })
-    if (selectedTitle && titles[index]?.zh === selectedTitle.zh) {
-      setSelectedTitle(replacement)
-    }
-    setNotice({ type: 'info', text: '单个标题已刷新。' })
   }
 
   async function generateArticle(options?: { refreshTarget?: 'initial' | 'body' | 'tdk'; preserveNotice?: boolean }) {
@@ -1520,7 +1534,7 @@ function App() {
                   }
                   disabled={!isPromptEditing}
                 >
-                  <option value="">不绑定规则</option>
+                  <option value="">---</option>
                   {(data?.rules ?? []).map((item) => (
                     <option key={item.id} value={item.id}>
                       {item.name}
@@ -2070,7 +2084,7 @@ function App() {
               </>
             ) : (
               <button type="button" onClick={() => void generateTitleOptions()} disabled={isBusy || !direction || !titlePromptId}>
-                生成 3 组选题
+                生成 4 组选题
               </button>
             )}
           </div>
@@ -2180,7 +2194,7 @@ function App() {
               ))
             ) : (
               <div className="placeholder-box">
-                <p>先生成 3 组标题，中英会同步显示在这里。</p>
+                <p>先生成 4 组标题，中英会同步显示在这里。</p>
               </div>
             )}
           </section>

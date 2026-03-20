@@ -733,6 +733,7 @@ app.post('/api/generate/titles', async (req, res) => {
   const titlePrompt = pickTitlePrompt(payload.direction, payload.titlePromptId ?? null)
   const product = payload.productId ? getProductById(payload.productId) : null
   const company = getCompanyProfile()
+  const recentEnglishTitles = getRecentEnglishTitleHistory(20)
 
   if (!settings.apiUrl || !settings.apiKey || !settings.modelName) {
     res.status(400).json({ error: '请先在设置区填写 API URL、API Key 和模型名称。' })
@@ -746,6 +747,7 @@ app.post('/api/generate/titles', async (req, res) => {
     keyword: payload.keyword?.trim() || '',
     company,
     product,
+    recentEnglishTitles,
   })
 
   if (!titles.length) {
@@ -1020,6 +1022,7 @@ app.post('/api/generate/batch', async (req, res) => {
       keyword: '',
       company: getCompanyProfile(),
       product,
+      recentEnglishTitles: getRecentEnglishTitleHistory(20),
     })
 
     const selectedTitle = titles[0]
@@ -1269,6 +1272,20 @@ function getHistory(): HistoryRecord[] {
   return rows.map(mapHistoryRecord)
 }
 
+function getRecentEnglishTitleHistory(limit = 20) {
+  const rows = db
+    .prepare(
+      `SELECT selected_title_en
+       FROM history
+       WHERE selected_title_en IS NOT NULL AND TRIM(selected_title_en) <> ''
+       ORDER BY created_at DESC, id DESC
+       LIMIT ?`,
+    )
+    .all(limit) as Array<{ selected_title_en: string }>
+
+  return rows.map((row) => String(row.selected_title_en).trim()).filter(Boolean)
+}
+
 function getHistoryById(id: number) {
   const row = db.prepare(`SELECT * FROM history WHERE id = ?`).get(id) as
     | Record<string, string | number | null>
@@ -1331,11 +1348,19 @@ function pickRule(_direction: string, template?: PromptTemplate | null) {
       return boundRule
     }
   }
-  return rules[0] ?? null
+  return null
 }
 
 function parseJsonArray(value: string) {
   return safeJson<string[]>(value, [])
+}
+
+function normalizeTitleKey(value: string) {
+  return value
+    .toLowerCase()
+    .replace(/&/g, ' and ')
+    .replace(/[^a-z0-9\u4e00-\u9fff]+/g, '')
+    .trim()
 }
 
 function normalizeChineseBodyOutput(value: string) {
@@ -1363,6 +1388,41 @@ function isEnglishHeavyParagraph(value: string) {
   }
 
   return englishWords >= 8 || (asciiLetters >= 45 && cjkChars < 10)
+}
+
+function buildBodyLengthGuidance(bodyPrompt: string, outputLanguage: OutputLanguage) {
+  const normalizedPrompt = bodyPrompt.trim()
+  const hasExplicitLength = /(\d{2,4})\s*(字|字符|字数|tokens?|token|words?|单词)|至少\s*\d{2,4}|不少于\s*\d{2,4}|\d{2,4}\s*[-~至到]\s*\d{2,4}/i.test(
+    normalizedPrompt,
+  )
+
+  if (hasExplicitLength) {
+    return `
+- 如果“正文要求”里已经明确写了字数、篇幅、单词数或 token 要求，以正文要求为准
+- 无论正文要求如何，中文正文最大不能超过 2000 个中文字符
+- 结构保持清晰，优先满足 SEO/GEO 的可读性和信息密度`
+  }
+
+  return `
+- 若“正文要求”未明确写长度，请按 SEO/GEO 友好的较长正文输出
+- 开头前 1-2 句先给出结论、答案或推荐结果，再展开说明
+- 中文正文建议控制在 900-1600 个中文字符之间，最大不超过 2000 个中文字符
+- ${outputLanguage === 'zh' ? '当前只输出中文正文' : '英文版保持与中文正文相近的信息密度，目标约 500-1000 tokens'}
+- 分 4-6 段，避免空泛铺陈，优先写清结果、理由、场景和选择建议`
+}
+
+function buildTdkRuleBlock(rule: TdkRule | null) {
+  if (!rule) {
+    return ''
+  }
+
+  return `
+TDK规则：
+- Title：${rule.titleRule || '无'}
+- Description：${rule.descriptionRule || '无'}
+- Keywords：${rule.keywordsRule || '无'}
+- 必带词：${rule.mustInclude.join(' / ') || '无'}
+- 禁用词：${rule.forbiddenWords.join(' / ') || '无'}`
 }
 
 function safeJson<T>(value: string, fallback: T): T {
@@ -1775,6 +1835,7 @@ async function generateTitles({
   keyword,
   company,
   product,
+  recentEnglishTitles,
 }: {
   settings: ReturnType<typeof getSettings>
   direction: string
@@ -1782,7 +1843,11 @@ async function generateTitles({
   keyword: string
   company: ReturnType<typeof getCompanyProfile>
   product: Product | null
+  recentEnglishTitles: string[]
 }) {
+  const recentEnglishTitleBlock = recentEnglishTitles.length
+    ? recentEnglishTitles.map((item, index) => `${index + 1}. ${item}`).join('\n')
+    : '暂无最近历史英文标题'
   const prompt = `
 你现在要为一个 SEO 工作流生成标题候选。
 
@@ -1800,17 +1865,30 @@ async function generateTitles({
 - 内容：${product?.content || '未指定'}
 - 关键词：${product?.keywords.join(' / ') || '暂无'}
 
-请只输出严格 JSON 数组，长度为 3，每项格式如下：
+最近 20 条历史英文标题（新标题不得与这些标题重复，也尽量避免语义近似）：
+${recentEnglishTitleBlock}
+
+请只输出严格 JSON 数组，长度为 4。要求 4 个标题彼此也必须明显不同，每项格式如下：
 [
   { "zh": "中文标题", "en": "English title", "reason": "简短理由" }
 ]
 `
 
   const raw = await llmRequest({ settings, prompt, timeoutMs: settings.titleTimeoutSec * 1000, maxTokens: 900 })
-  return safeJson<{ zh: string; en: string; reason: string }[]>(
+  const parsed = safeJson<{ zh: string; en: string; reason: string }[]>(
     extractJsonBlock(raw),
     [],
   )
+  const recentKeys = new Set(recentEnglishTitles.map(normalizeTitleKey))
+  const seen = new Set<string>()
+  return parsed.filter((item) => {
+    const key = normalizeTitleKey(item.en)
+    if (!key || recentKeys.has(key) || seen.has(key)) {
+      return false
+    }
+    seen.add(key)
+    return true
+  })
 }
 
 async function extractCompanyProfileFromDocument({
@@ -1954,47 +2032,37 @@ async function generateArticle({
     company,
     product,
     template,
-    rule,
     selectedTitle,
   })
 
+  let bodyEn = ''
   if (outputLanguage === 'zh') {
-    return {
+    bodyEn = await translateArticleBodyToEnglish({
+      settings,
+      direction,
+      keyword,
+      selectedTitle,
       bodyZh: articlePackageZh.bodyZh,
-      bodyEn: '',
-      tdk: {
-        titleZh: articlePackageZh.tdkTitleZh,
-        titleEn: '',
-        descriptionZh: articlePackageZh.tdkDescriptionZh,
-        descriptionEn: '',
-        keywordsZh: articlePackageZh.tdkKeywordsZh,
-        keywordsEn: '',
-      },
-    }
+      bodyPrompt: template?.bodyPrompt || '',
+    })
   }
 
-  const translatedPackage = await translateArticleBodyToEnglish({
+  const tdk = await generateTdkForExistingBody({
     settings,
     direction,
     keyword,
+    outputLanguage,
     selectedTitle,
     bodyZh: articlePackageZh.bodyZh,
-    tdkTitleZh: articlePackageZh.tdkTitleZh,
-    tdkDescriptionZh: articlePackageZh.tdkDescriptionZh,
-    tdkKeywordsZh: articlePackageZh.tdkKeywordsZh,
+    bodyEn,
+    template,
+    rule,
   })
 
   return {
     bodyZh: articlePackageZh.bodyZh,
-    bodyEn: translatedPackage.bodyEn,
-    tdk: {
-      titleZh: outputLanguage === 'en' ? '' : articlePackageZh.tdkTitleZh,
-      titleEn: translatedPackage.tdkTitleEn,
-      descriptionZh: outputLanguage === 'en' ? '' : articlePackageZh.tdkDescriptionZh,
-      descriptionEn: translatedPackage.tdkDescriptionEn,
-      keywordsZh: outputLanguage === 'en' ? '' : articlePackageZh.tdkKeywordsZh,
-      keywordsEn: translatedPackage.tdkKeywordsEn,
-    },
+    bodyEn,
+    tdk,
   }
 }
 
@@ -2080,6 +2148,7 @@ async function generateChineseTdk({
   template: PromptTemplate | null
   rule: TdkRule | null
 }) {
+  const tdkRuleBlock = buildTdkRuleBlock(rule)
   const prompt = `
 你现在只负责根据现有中文正文与标题生成中文 TDK，不要重写正文，不要输出英文，不要输出解释。
 
@@ -2093,12 +2162,7 @@ ${bodyZh}
 TDK要求：
 ${template?.tdkPrompt || '输出中文 TDK'}
 
-TDK规则：
-- Title：${rule?.titleRule || 'Title 保持精炼'}
-- Description：${rule?.descriptionRule || 'Description 简洁准确'}
-- Keywords：${rule?.keywordsRule || 'Keywords 自然精炼'}
-- 必带词：${rule?.mustInclude.join(' / ') || '无'}
-- 禁用词：${rule?.forbiddenWords.join(' / ') || '无'}
+${tdkRuleBlock}
 
 请严格按以下标签输出，不要输出其他说明：
 [TDK_TITLE_ZH]
@@ -2142,7 +2206,6 @@ async function generateArticleBody({
   company,
   product,
   template,
-  rule,
   selectedTitle,
 }: {
   settings: ReturnType<typeof getSettings>
@@ -2152,7 +2215,6 @@ async function generateArticleBody({
   company: ReturnType<typeof getCompanyProfile>
   product: Product | null
   template: PromptTemplate | null
-  rule: TdkRule | null
   selectedTitle: { zh: string; en: string }
 }) {
   const companyRawExcerpt = company.rawContent.replace(/\s+/g, ' ').slice(0, 360)
@@ -2169,12 +2231,14 @@ async function generateArticleBody({
 - 场景：${company.scenarios.join(' / ') || '暂无'}
 `
     : ''
+  const lengthGuidance = buildBodyLengthGuidance(template?.bodyPrompt || '', outputLanguage)
 
   const prompt = `
-你现在只负责输出中文 SEO 正文与中文 TDK，不要输出英文，不要输出解释。
+你现在只负责输出中文 SEO 正文，不要输出 TDK，不要输出英文，不要输出解释。
 注意：即使下方模板提到“双语”“中英”“英文”或“翻译”，本阶段也一律忽略；本阶段只能输出中文。
 注意：如果公司资料或产品资料里出现英文内容，你必须先理解后改写成中文，不能把英文原句直接写进 [BODY_ZH]。
 注意：[BODY_ZH] 里不能出现完整英文段落，不能把中文段落和英文段落混排。
+注意：正文开头必须先给出答案、结果、推荐结论或核心判断，再展开细节；这是 SEO/GEO 的优先要求。
 
 文案方向：${direction}
 关键词：${keyword || '未指定'}
@@ -2186,8 +2250,7 @@ ${bodyInstructions}
 输出语言：${outputLanguage === 'en' ? '仅英文，先产出中文底稿再翻译为英文' : outputLanguage === 'zh-en' ? '中英双语，当前这一步只产出中文底稿' : '仅中文'}
 
 长度控制：
-- 中文正文控制在 300-420 个中文字符之间
-- 分 3-4 段
+${lengthGuidance}
 - 每段都必须以中文为主，不得出现连续 8 个以上英文单词
 - 不要输出推理过程、注释或额外说明
 
@@ -2199,56 +2262,27 @@ ${companyContext}
 - 产品关键词：${product?.keywords.join(' / ') || '暂无'}
 - 产品场景：${product?.scenarios.join(' / ') || '暂无'}
 
-TDK要求：
-${template?.tdkPrompt || '输出中文 TDK'}
-
-TDK规则：
-- Title：${rule?.titleRule || 'Title 保持精炼'}
-- Description：${rule?.descriptionRule || 'Description 简洁准确'}
-- Keywords：${rule?.keywordsRule || 'Keywords 自然精炼'}
-- 必带词：${rule?.mustInclude.join(' / ') || '无'}
-- 禁用词：${rule?.forbiddenWords.join(' / ') || '无'}
-
 请严格按以下标签输出，不要输出其他说明：
 [BODY_ZH]
 中文正文，使用换行分段
 [/BODY_ZH]
-[TDK_TITLE_ZH]
-中文Title
-[/TDK_TITLE_ZH]
-[TDK_DESCRIPTION_ZH]
-中文Description
-[/TDK_DESCRIPTION_ZH]
-[TDK_KEYWORDS_ZH]
-中文关键词，逗号分隔
-[/TDK_KEYWORDS_ZH]
 `
 
   const raw = await llmRequest({
     settings,
     prompt,
     timeoutMs: settings.articleTimeoutSec * 1000,
-    maxTokens: 900,
+    maxTokens: 2600,
   })
   const rawBodyZh = extractTaggedBlock(raw, 'BODY_ZH')
   const bodyZh = rawBodyZh ? normalizeChineseBodyOutput(rawBodyZh) : ''
-  const tdkTitleZh = extractTaggedBlock(raw, 'TDK_TITLE_ZH')
-  const tdkDescriptionZh = extractTaggedBlock(raw, 'TDK_DESCRIPTION_ZH')
-  const tdkKeywordsZh = extractTaggedBlock(raw, 'TDK_KEYWORDS_ZH')
 
   if (!bodyZh) {
     throw new Error('正文生成失败：模型返回内容未能解析为有效的中文正文。')
   }
 
-  if (!tdkTitleZh || !tdkDescriptionZh) {
-    throw new Error('TDK 生成失败：模型返回内容未能解析为有效的中文 TDK。')
-  }
-
   return {
     bodyZh,
-    tdkTitleZh,
-    tdkDescriptionZh,
-    tdkKeywordsZh,
   }
 }
 
@@ -2258,21 +2292,20 @@ async function translateArticleBodyToEnglish({
   keyword,
   selectedTitle,
   bodyZh,
-  tdkTitleZh,
-  tdkDescriptionZh,
-  tdkKeywordsZh,
+  bodyPrompt,
 }: {
   settings: ReturnType<typeof getSettings>
   direction: string
   keyword: string
   selectedTitle: { zh: string; en: string }
   bodyZh: string
-  tdkTitleZh: string
-  tdkDescriptionZh: string
-  tdkKeywordsZh: string
+  bodyPrompt: string
 }) {
+  const hasExplicitLength = /(\d{2,4})\s*(字|字符|字数|tokens?|token|words?|单词)|至少\s*\d{2,4}|不少于\s*\d{2,4}|\d{2,4}\s*[-~至到]\s*\d{2,4}/i.test(
+    bodyPrompt,
+  )
   const prompt = `
-你现在只负责把中文 SEO 正文和中文 TDK 转成自然、专业、可读的英文，不要输出中文，不要输出解释。
+你现在只负责把中文 SEO 正文转成自然、专业、可读的英文，不要输出 TDK，不要输出中文，不要输出解释。
 
 文案方向：${direction}
 关键词：${keyword || '未指定'}
@@ -2284,55 +2317,31 @@ async function translateArticleBodyToEnglish({
 - 保持原文结构和段落数量
 - 用自然英文改写，不要逐字硬翻
 - 保留 SEO 可读性和专业语气
-- 英文正文控制在 220-320 个单词之间
+- 开头先给出答案、结果、推荐结论或核心判断，再展开细节
+- ${hasExplicitLength ? '若原中文正文已按正文要求控制长度，请保持与原文相近的信息密度和篇幅，但不要无意义扩写' : '若正文要求未明确写长度，请按适合 SEO/GEO 的英文长文输出，目标约 500-1000 tokens'}
 - 英文 TDK 要自然，不要直接照搬中文语序
 
 中文正文：
 ${bodyZh}
 
-中文 TDK：
-- Title：${tdkTitleZh}
-- Description：${tdkDescriptionZh}
-- Keywords：${tdkKeywordsZh || '无'}
-
 请严格按以下标签输出，不要输出其他说明：
 [BODY_EN]
 English body with paragraph breaks
 [/BODY_EN]
-[TDK_TITLE_EN]
-English Title
-[/TDK_TITLE_EN]
-[TDK_DESCRIPTION_EN]
-English Description
-[/TDK_DESCRIPTION_EN]
-[TDK_KEYWORDS_EN]
-English keywords, comma separated
-[/TDK_KEYWORDS_EN]
 `
 
   const raw = await llmRequest({
     settings,
     prompt,
     timeoutMs: settings.englishTimeoutSec * 1000,
-    maxTokens: 700,
+    maxTokens: 1800,
   })
   const bodyEn = extractTaggedBlock(raw, 'BODY_EN')
-  const tdkTitleEn = extractTaggedBlock(raw, 'TDK_TITLE_EN')
-  const tdkDescriptionEn = extractTaggedBlock(raw, 'TDK_DESCRIPTION_EN')
-  const tdkKeywordsEn = extractTaggedBlock(raw, 'TDK_KEYWORDS_EN')
 
   if (!bodyEn) {
     throw new Error('英文翻译失败：模型返回内容未能解析为有效的英文正文。')
   }
-  if (!tdkTitleEn || !tdkDescriptionEn) {
-    throw new Error('英文 TDK 生成失败：模型返回内容未能解析为有效的英文 TDK。')
-  }
-  return {
-    bodyEn,
-    tdkTitleEn,
-    tdkDescriptionEn,
-    tdkKeywordsEn,
-  }
+  return bodyEn
 }
 
 async function generateEnglishTdk({
