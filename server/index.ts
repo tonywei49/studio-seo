@@ -292,15 +292,15 @@ app.post('/api/settings/test-llm', async (req, res) => {
 
   const raw = await llmRequest({
     settings,
-    prompt: '请输出严格 JSON：{"status":"ok","reply":"连接成功"}',
+    prompt: '请只回复：OK',
     timeoutMs: 15000,
-    responseFormat: 'json_object',
+    maxTokens: 32,
   })
-  const parsed = safeJson<{ status?: string; reply?: string }>(extractJsonBlock(raw), {})
+  const message = raw.trim().slice(0, 160)
 
   res.json({
     success: true,
-    message: parsed.reply || raw.slice(0, 160) || '连接成功',
+    message: message || '连接成功',
   })
 })
 
@@ -2036,7 +2036,7 @@ async function generateArticle({
   })
 
   let bodyEn = ''
-  if (outputLanguage === 'zh') {
+  if (outputLanguage !== 'zh') {
     bodyEn = await translateArticleBodyToEnglish({
       settings,
       direction,
