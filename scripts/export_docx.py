@@ -1,31 +1,32 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import importlib
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
-from docx import Document
-from docx.enum.text import WD_BREAK
-from docx.oxml.ns import qn
-from docx.shared import Pt
+Document = importlib.import_module("docx").Document
+qn = importlib.import_module("docx.oxml.ns").qn
+Pt = importlib.import_module("docx.shared").Pt
 
 
-def set_run_font(run, size_pt: int, bold: bool = False) -> None:
+def set_run_font(run: Any, size_pt: int, bold: bool = False) -> None:
     run.bold = bold
     run.font.size = Pt(size_pt)
     run.font.name = "Microsoft YaHei"
     run._element.rPr.rFonts.set(qn("w:eastAsia"), "Microsoft YaHei")
 
 
-def add_paragraph(document: Document, text: str, size_pt: int, bold: bool = False, space_after_pt: int = 0) -> None:
+def add_paragraph(document: Any, text: str, size_pt: int, bold: bool = False, space_after_pt: int = 0) -> None:
     paragraph = document.add_paragraph()
     paragraph.paragraph_format.space_after = Pt(space_after_pt)
     run = paragraph.add_run(text)
     set_run_font(run, size_pt, bold)
 
 
-def add_body_block(document: Document, heading: str, body: str) -> None:
+def add_body_block(document: Any, heading: str, body: str) -> None:
     if not body.strip():
         return
     add_paragraph(document, heading, 14, True, 8)
@@ -36,7 +37,7 @@ def add_body_block(document: Document, heading: str, body: str) -> None:
             document.add_paragraph()
 
 
-def add_tdk_block(document: Document, label: str, value: str) -> None:
+def add_tdk_block(document: Any, label: str, value: str) -> None:
     if not value.strip():
         return
     add_paragraph(document, f"{label}{value}", 14, False, 10)
@@ -72,13 +73,24 @@ def main() -> int:
         add_body_block(document, "English Body", payload["bodyEn"])
         document.add_paragraph()
 
-    add_paragraph(document, "TDK", 14, True, 8)
-    if output_language != "en":
+    has_zh_tdk = any(
+        str(payload[key]).strip()
+        for key in ("tdkTitleZh", "tdkDescriptionZh", "tdkKeywordsZh")
+    )
+    has_en_tdk = any(
+        str(payload[key]).strip()
+        for key in ("tdkTitleEn", "tdkDescriptionEn", "tdkKeywordsEn")
+    )
+
+    if has_zh_tdk or has_en_tdk:
+        add_paragraph(document, "TDK", 14, True, 8)
+
+    if output_language != "en" and has_zh_tdk:
         add_tdk_block(document, "Title (ZH): ", payload["tdkTitleZh"])
         add_tdk_block(document, "Description (ZH): ", payload["tdkDescriptionZh"])
         add_tdk_block(document, "Keywords (ZH): ", payload["tdkKeywordsZh"])
         document.add_paragraph()
-    if output_language != "zh":
+    if output_language != "zh" and has_en_tdk:
         add_tdk_block(document, "Title (EN): ", payload["tdkTitleEn"])
         add_tdk_block(document, "Description (EN): ", payload["tdkDescriptionEn"])
         add_tdk_block(document, "Keywords (EN): ", payload["tdkKeywordsEn"])
