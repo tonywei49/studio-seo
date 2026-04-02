@@ -19,6 +19,8 @@ data/secret.key
 data/uploads
 data/exports
 *.rtf
+__pycache__/
+*.pyc
 
 # Editor directories and files
 .vscode/*

@@ -1,4 +1,4 @@
-export type OutputLanguage = 'zh-en' | 'zh' | 'en'
+export type OutputLanguage = 'zh' | 'en'
 
 export type Settings = {
   apiUrl: string

@@ -17,8 +17,13 @@ import type {
 
 type ViewKey = 'settings' | 'output' | 'history'
 type ThemeMode = 'normal' | 'brutal'
-type ProcessKind = 'titles' | 'article' | 'batch'
+type ProcessKind = 'titles' | 'article' | 'translate' | 'batch'
 type DocumentTaskKind = 'company' | 'product'
+type RichTextBlock = {
+  kind: 'heading' | 'paragraph'
+  level: 1 | 2 | 3
+  text: string
+}
 type NoticeState = {
   type: 'success' | 'error' | 'info'
   text: string
@@ -26,6 +31,7 @@ type NoticeState = {
   linkPath?: string
   linkLabel?: string
 }
+type OperationTimings = Record<string, number>
 
 const PASSCODE = '魏裕弘真帅'
 
@@ -63,8 +69,189 @@ const emptyProduct = (): Omit<Product, 'id' | 'createdAt' | 'updatedAt'> => ({
 
 const processLabels: Record<ProcessKind, string[]> = {
   titles: ['加载规则', '拼接上下文', '生成候选标题', '同步输出面板'],
-  article: ['锁定标题', '生成中英正文', '生成 TDK', '导出并写入历史'],
+  article: ['锁定标题', '生成正文', '生成 TDK', '写入历史'],
+  translate: ['读取原文', '翻译正文', '翻译 TDK', '同步历史'],
   batch: ['校验批量参数', '轮询生成标题', '批量落库导出', '刷新历史记录'],
+}
+
+const timingLabelMap: Record<string, string> = {
+  bodyMs: '正文',
+  tdkMs: 'TDK',
+  translateMs: '翻译',
+  translateBodyMs: '正文翻译',
+  translateTdkMs: 'TDK翻译',
+  dbMs: '写入',
+  totalMs: '总计',
+}
+
+function escapeHtml(value: string) {
+  return value
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;')
+}
+
+function stripMarkdownHeading(value: string) {
+  return value.replace(/^#{1,6}\s+/, '').trim()
+}
+
+function normalizeComparableText(value: string) {
+  return stripMarkdownHeading(value)
+    .replace(/\s+/g, ' ')
+    .replace(/[：:;；。！？.!?]/g, '')
+    .trim()
+    .toLowerCase()
+}
+
+function detectHeadingLevel(block: string, index: number): 1 | 2 | 3 | null {
+  const markdownMatch = block.match(/^(#{1,6})\s+(.+)$/)
+  if (markdownMatch) {
+    return Math.min(3, markdownMatch[1].length) as 1 | 2 | 3
+  }
+
+  const normalized = block.replace(/\s+/g, ' ').trim()
+  if (!normalized || normalized.includes('\n') || normalized.length > 120) {
+    return null
+  }
+
+  if (/^[-*]\s+/.test(normalized)) {
+    return null
+  }
+
+  const hardSentencePunctuation = (normalized.match(/[。！？.!?]/g) ?? []).length
+  const softSentencePunctuation = (normalized.match(/[；;]/g) ?? []).length
+  const words = normalized.split(/\s+/).filter(Boolean)
+  const hasHeadingPrefix = /^(第[一二三四五六七八九十0-9]+[章节部分篇]|[一二三四五六七八九十0-9]+[、.．)）])/.test(normalized)
+  const looksLikeEnglishHeading =
+    /[A-Za-z]/.test(normalized) && words.length <= 14 && hardSentencePunctuation === 0 && softSentencePunctuation <= 1
+  const looksLikeShortHeading =
+    normalized.length <= 34 && hardSentencePunctuation === 0 && softSentencePunctuation <= 1
+  const endsWithColon = /[:：]$/.test(normalized)
+
+  if (hasHeadingPrefix || looksLikeEnglishHeading || looksLikeShortHeading || endsWithColon) {
+    return index === 0 ? 1 : normalized.length <= 18 ? 3 : 2
+  }
+
+  return null
+}
+
+function toOperationTimings(value: unknown): OperationTimings | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null
+  }
+
+  const entries = Object.entries(value).filter(([, item]) => typeof item === 'number' && Number.isFinite(item))
+  if (!entries.length) {
+    return null
+  }
+
+  return Object.fromEntries(entries) as OperationTimings
+}
+
+function formatTimingMs(value: number) {
+  return `${(value / 1000).toFixed(value >= 10000 ? 1 : 2)}s`
+}
+
+function formatTimingSummary(timings?: OperationTimings | null) {
+  if (!timings) {
+    return ''
+  }
+
+  const orderedKeys = ['bodyMs', 'tdkMs', 'translateMs', 'translateBodyMs', 'translateTdkMs', 'dbMs', 'totalMs']
+  const parts = orderedKeys
+    .filter((key) => typeof timings[key] === 'number')
+    .map((key) => `${timingLabelMap[key] || key} ${formatTimingMs(timings[key])}`)
+
+  return parts.join(' · ')
+}
+
+function readTimingSnapshot(meta: HistoryRecord['meta']) {
+  const timings = toOperationTimings(meta.lastOperationTimings)
+  if (!timings) {
+    return null
+  }
+
+  const operation = typeof meta.lastOperation === 'string' ? meta.lastOperation : ''
+  const operationLabel =
+    operation === 'translate'
+      ? '最近翻译耗时'
+      : operation === 'tdk'
+        ? '最近 TDK 耗时'
+        : operation === 'body'
+          ? '最近正文耗时'
+          : '最近生成耗时'
+  return {
+    operationLabel,
+    text: formatTimingSummary(timings),
+  }
+}
+
+function toRichTextBlocks(text: string) {
+  const normalized = text.replace(/\r\n/g, '\n').trim()
+  if (!normalized) {
+    return [] as RichTextBlock[]
+  }
+
+  return normalized
+    .split(/\n\s*\n+/)
+    .map((block) => block.trim())
+    .filter(Boolean)
+    .map((block, index) => {
+      const level = detectHeadingLevel(block, index)
+      return {
+        kind: level ? 'heading' : 'paragraph',
+        level: level ?? 2,
+        text: stripMarkdownHeading(block),
+      } satisfies RichTextBlock
+    })
+}
+
+function formatInlineRichText(text: string) {
+  return escapeHtml(text)
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/__(.+?)__/g, '<strong>$1</strong>')
+    .replace(/\n/g, '<br />')
+}
+
+function buildRichTextHtml(text: string, title?: string) {
+  const blocks = toRichTextBlocks(text)
+  const normalizedTitle = title?.trim() ? normalizeComparableText(title) : ''
+
+  if (normalizedTitle) {
+    if (blocks.length && normalizeComparableText(blocks[0].text) === normalizedTitle) {
+      blocks[0] = { ...blocks[0], kind: 'heading', level: 1 }
+    } else {
+      blocks.unshift({ kind: 'heading', level: 1, text: title!.trim() })
+    }
+  }
+
+  return blocks
+    .map((block) => {
+      const tag = block.kind === 'heading' ? `h${block.level}` : 'p'
+      return `<${tag}>${formatInlineRichText(block.text)}</${tag}>`
+    })
+    .join('')
+}
+
+function buildPlainArticleText(text: string, title?: string) {
+  const normalizedText = text.trim()
+  const normalizedTitle = title?.trim()
+  if (!normalizedTitle) {
+    return normalizedText
+  }
+  if (!normalizedText) {
+    return normalizedTitle
+  }
+  if (normalizeComparableText(normalizedText.split(/\n/)[0] ?? '') === normalizeComparableText(normalizedTitle)) {
+    return normalizedText
+  }
+  return `${normalizedTitle}\n\n${normalizedText}`
+}
+
+function normalizeOutputLanguage(value: unknown): OutputLanguage {
+  return value === 'en' ? 'en' : 'zh'
 }
 
 function App() {
@@ -79,7 +266,7 @@ function App() {
   const [settingsTesting, setSettingsTesting] = useState(false)
   const [testResult, setTestResult] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
   const [copyToast, setCopyToast] = useState<string | null>(null)
-  const [articleRefreshTarget, setArticleRefreshTarget] = useState<'initial' | 'body' | 'tdk' | null>(null)
+  const [articleRefreshTarget, setArticleRefreshTarget] = useState<'initial' | 'body' | 'tdk' | 'translate' | null>(null)
   const [outputStatus, setOutputStatus] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null)
 
   const [settingsForm, setSettingsForm] = useState({
@@ -119,7 +306,7 @@ function App() {
   const [keyword, setKeyword] = useState('')
   const [productId, setProductId] = useState<number | null>(null)
   const [exportFormat, setExportFormat] = useState<'md' | 'docx'>('md')
-  const [outputLanguage, setOutputLanguage] = useState<OutputLanguage>('zh-en')
+  const [outputLanguage, setOutputLanguage] = useState<OutputLanguage>('zh')
   const [titles, setTitles] = useState<TitleOption[]>([])
   const [selectedTitle, setSelectedTitle] = useState<TitleOption | null>(null)
   const [latestRecord, setLatestRecord] = useState<HistoryRecord | null>(null)
@@ -725,6 +912,29 @@ function App() {
     setCopyToast('已复制')
   }
 
+  async function copyArticle(label: string, text: string, title: string) {
+    const plainText = buildPlainArticleText(text, title)
+    const html = `<div>${buildRichTextHtml(text, title)}</div>`
+
+    try {
+      if (navigator.clipboard.write && typeof ClipboardItem !== 'undefined') {
+        await navigator.clipboard.write([
+          new ClipboardItem({
+            'text/html': new Blob([html], { type: 'text/html' }),
+            'text/plain': new Blob([plainText], { type: 'text/plain' }),
+          }),
+        ])
+        setCopyToast(`${label}已复制，可直接粘贴到编辑器`)
+        return
+      }
+    } catch (error) {
+      console.warn('富文本复制失败，回退为纯文本复制', error)
+    }
+
+    await navigator.clipboard.writeText(plainText)
+    setCopyToast(`${label}已复制`)
+  }
+
   async function generateTitleOptions() {
     setOutputStatus(null)
     setNotice({ type: 'info', text: '正在生成标题候选，请等待模型返回结果...' })
@@ -802,15 +1012,16 @@ function App() {
 
     setOutputStatus(null)
     setArticleRefreshTarget(options?.refreshTarget ?? 'initial')
+    let createdRecord: HistoryRecord | null = null
     try {
       const response = await withBusy('article', () =>
         requestJson<{
           record: HistoryRecord | null
           records: HistoryRecord[]
           history: HistoryRecord[]
-          savedPath: string
           processor?: 'llm' | 'rule'
           processorMessage?: string
+          timings?: OperationTimings
         }>('/api/generate/article', {
           method: 'POST',
           body: JSON.stringify({
@@ -823,22 +1034,29 @@ function App() {
             titles,
             selectedTitle: { zh: effectiveSelectedTitle.zh, en: effectiveSelectedTitle.en },
             quantity: 1,
-            exportFormat,
           }),
         }),
       )
 
-      setLatestRecord(response.record)
+      createdRecord = response.record
+      if (response.record) {
+        applyOutputRecord(response.record, response.history)
+      }
       setBatchResults(response.records.length > 1 ? response.records : [])
-      setData((current) => (current ? { ...current, history: response.history } : current))
       setActiveView('output')
+      const timingSummary = formatTimingSummary(response.timings)
+      setOutputStatus({
+        type: 'info',
+        text: `${response.processorMessage ? `${response.processorMessage} ` : ''}正文已生成，正在生成 TDK。${
+          timingSummary ? ` ${timingSummary}` : ''
+        }`,
+      })
       if (!options?.preserveNotice) {
         setNotice({
           type: response.processor === 'rule' ? 'info' : 'success',
-          variant: 'result',
-          text: `${response.processorMessage ? `${response.processorMessage} ` : ''}正文与 TDK 已生成，共 ${response.records.length} 组。`,
-          linkPath: response.savedPath,
-          linkLabel: fileNameFromPath(response.savedPath),
+          text: `${response.processorMessage ? `${response.processorMessage} ` : ''}正文已生成，TDK 将继续补全。${
+            timingSummary ? ` ${timingSummary}` : ''
+          }`,
         })
       }
     } catch (error) {
@@ -850,6 +1068,10 @@ function App() {
     } finally {
       setArticleRefreshTarget(null)
     }
+
+    if (createdRecord) {
+      await generateTdkForRecord(createdRecord.id, { afterBody: true })
+    }
   }
 
   async function regenerateLatestRecord(target: 'body' | 'tdk') {
@@ -859,27 +1081,66 @@ function App() {
     }
 
     setOutputStatus(null)
-    setArticleRefreshTarget(target)
+    if (target === 'tdk') {
+      await generateTdkForRecord(latestRecord.id)
+      return
+    }
+
+    setArticleRefreshTarget('body')
+    let refreshedRecord: HistoryRecord | null = null
     try {
       const response = await withBusy('article', () =>
-        requestJson<{ record: HistoryRecord; history: HistoryRecord[] }>(`/api/history/${latestRecord.id}/regenerate`, {
-          method: 'POST',
-          body: JSON.stringify({ target }),
-        }),
+        requestJson<{ record: HistoryRecord; history: HistoryRecord[]; timings?: OperationTimings }>(
+          `/api/history/${latestRecord.id}/regenerate`,
+          {
+            method: 'POST',
+            body: JSON.stringify({ target: 'body' }),
+          },
+        ),
+      )
+      refreshedRecord = response.record
+      applyOutputRecord(response.record, response.history)
+      setOutputStatus({
+        type: 'info',
+        text: `正文已重新生成，正在生成 TDK。${response.timings ? ` ${formatTimingSummary(response.timings)}` : ''}`,
+      })
+    } catch (error) {
+      setOutputStatus({ type: 'error', text: getErrorMessage(error) })
+    } finally {
+      setArticleRefreshTarget(null)
+    }
+
+    if (refreshedRecord) {
+      await generateTdkForRecord(refreshedRecord.id, { afterBody: true })
+    }
+  }
+
+  async function translateLatestRecord(targetLanguage: OutputLanguage) {
+    if (!latestRecord) {
+      setOutputStatus({ type: 'error', text: '当前没有可翻译的内容。' })
+      return
+    }
+
+    setOutputStatus(null)
+    setArticleRefreshTarget('translate')
+    try {
+      const response = await withBusy('translate', () =>
+        requestJson<{ record: HistoryRecord; history: HistoryRecord[]; timings?: OperationTimings }>(
+          `/api/history/${latestRecord.id}/translate`,
+          {
+            method: 'POST',
+            body: JSON.stringify({ targetLanguage }),
+          },
+        ),
       )
       setLatestRecord(response.record)
       setData((current) => (current ? { ...current, history: response.history } : current))
-      setTitles(response.record.titleOptions)
-      setSelectedTitle(
-        response.record.titleOptions.find(
-          (item) => item.zh === response.record.selectedTitleZh && item.en === response.record.selectedTitleEn,
-        ) ?? {
-          zh: response.record.selectedTitleZh,
-          en: response.record.selectedTitleEn,
-          reason: '重新生成结果',
-        },
-      )
-      setArticlePromptId(response.record.promptTemplateId)
+      setOutputStatus({
+        type: 'success',
+        text: `${targetLanguage === 'zh' ? '中文翻译已生成。' : '英文翻译已生成。'}${
+          response.timings ? ` ${formatTimingSummary(response.timings)}` : ''
+        }`,
+      })
     } catch (error) {
       setOutputStatus({ type: 'error', text: getErrorMessage(error) })
     } finally {
@@ -900,6 +1161,7 @@ function App() {
           quantity: batchCount,
           directionPool: batchDirections,
           productIds: batchProductIds,
+          outputLanguage,
           exportFormat,
         }),
       }),
@@ -929,7 +1191,7 @@ function App() {
     setNotice({
       type: 'success',
       variant: 'result',
-      text: '文件已重新导出。',
+      text: '已保存到本地。',
       linkPath: response.savedPath,
       linkLabel: fileNameFromPath(response.savedPath),
     })
@@ -953,6 +1215,50 @@ function App() {
     setArticleRefreshTarget(null)
   }
 
+  function applyOutputRecord(record: HistoryRecord, history: HistoryRecord[]) {
+    setLatestRecord(record)
+    setData((current) => (current ? { ...current, history } : current))
+    setTitles(record.titleOptions)
+    setSelectedTitle(
+      record.titleOptions.find(
+        (item) => item.zh === record.selectedTitleZh && item.en === record.selectedTitleEn,
+      ) ?? {
+        zh: record.selectedTitleZh,
+        en: record.selectedTitleEn,
+        reason: '输出结果',
+      },
+    )
+    setArticlePromptId(record.promptTemplateId)
+  }
+
+  async function generateTdkForRecord(recordId: number, options?: { afterBody?: boolean }) {
+    setArticleRefreshTarget('tdk')
+    try {
+      const response = await withBusy('article', () =>
+        requestJson<{ record: HistoryRecord; history: HistoryRecord[]; timings?: OperationTimings }>(
+          `/api/history/${recordId}/regenerate`,
+          {
+            method: 'POST',
+            body: JSON.stringify({ target: 'tdk' }),
+          },
+        ),
+      )
+      applyOutputRecord(response.record, response.history)
+      setOutputStatus({
+        type: 'success',
+        text: `${
+          options?.afterBody ? 'TDK 已补全。' : 'TDK 已重新生成。'
+        }${response.timings ? ` ${formatTimingSummary(response.timings)}` : ''}`,
+      })
+      return response.record
+    } catch (error) {
+      setOutputStatus({ type: 'error', text: `TDK 生成失败：${getErrorMessage(error)}` })
+      return null
+    } finally {
+      setArticleRefreshTarget(null)
+    }
+  }
+
   function loadHistoryRecord(record: HistoryRecord) {
     const matchedTitle =
       record.titleOptions.find(
@@ -965,7 +1271,7 @@ function App() {
     skipOutputResetRef.current = true
     setDirection(record.direction)
     setProductId(record.productId)
-    setOutputLanguage(record.meta.outputLanguage ?? 'zh-en')
+    setOutputLanguage(normalizeOutputLanguage(record.meta.outputLanguage))
     setTitles(record.titleOptions)
     setSelectedTitle(matchedTitle)
     setArticlePromptId(record.promptTemplateId)
@@ -990,7 +1296,7 @@ function App() {
             <p className="eyebrow">LOCAL SEO MATRIX STUDIO</p>
             <h1>SEO 文案矩阵控制台</h1>
             <p className="hero-copy">
-              本地网页工具，使用单一公司资料、产品库、Prompt 与 TDK 规则，生成中英双语 SEO 标题、正文和 TDK。
+              本地网页工具，使用单一公司资料、产品库、 Prompt 与 TDK 规则，生成中英标题，以及单语正文与 TDK，再按需补翻译。
             </p>
           </div>
           <div className="hero-stats">
@@ -1943,13 +2249,30 @@ function App() {
   }
 
   function renderOutput() {
-    const isArticleProcessing = processKind === 'article'
-    const bodyRefreshing = isArticleProcessing && articleRefreshTarget === 'body' && Boolean(latestRecord)
+    const isOutputProcessing = processKind === 'article' || processKind === 'translate'
+    const bodyRefreshing = isOutputProcessing && Boolean(latestRecord) && articleRefreshTarget === 'body'
+    const translationRefreshing = processKind === 'translate' && Boolean(latestRecord) && articleRefreshTarget === 'translate'
     const tdkRefreshing =
-      isArticleProcessing && Boolean(latestRecord) && (articleRefreshTarget === 'body' || articleRefreshTarget === 'tdk')
-    const currentOutputLanguage = (latestRecord?.meta.outputLanguage as OutputLanguage | undefined) ?? outputLanguage
-    const showZhOutput = currentOutputLanguage !== 'en'
-    const showEnOutput = currentOutputLanguage !== 'zh'
+      isOutputProcessing && Boolean(latestRecord) && (articleRefreshTarget === 'body' || articleRefreshTarget === 'tdk')
+    const hasZhBody = Boolean(latestRecord?.bodyZh.trim())
+    const hasEnBody = Boolean(latestRecord?.bodyEn.trim())
+    const hasZhTdk = Boolean(
+      latestRecord && (latestRecord.tdkTitleZh.trim() || latestRecord.tdkDescriptionZh.trim() || latestRecord.tdkKeywordsZh.trim()),
+    )
+    const hasEnTdk = Boolean(
+      latestRecord && (latestRecord.tdkTitleEn.trim() || latestRecord.tdkDescriptionEn.trim() || latestRecord.tdkKeywordsEn.trim()),
+    )
+    const translationTarget =
+      latestRecord && !hasEnBody && hasZhBody ? 'en' : latestRecord && !hasZhBody && hasEnBody ? 'zh' : null
+    const bodyTitle =
+      latestRecord && hasZhBody && !hasEnBody ? latestRecord.selectedTitleZh : latestRecord?.selectedTitleEn || latestRecord?.selectedTitleZh
+    const processingLabel =
+      articleRefreshTarget === 'translate'
+        ? '正在生成翻译...'
+        : articleRefreshTarget === 'tdk'
+          ? '正在生成TDK...'
+          : '正在生成正文...'
+    const timingSnapshot = latestRecord ? readTimingSnapshot(latestRecord.meta) : null
 
     return (
       <main className="content-grid output-grid">
@@ -2030,7 +2353,6 @@ function App() {
             <label>
               <span>输出语言</span>
               <select value={outputLanguage} onChange={(event) => setOutputLanguage(event.target.value as OutputLanguage)}>
-                <option value="zh-en">中 + 英</option>
                 <option value="zh">仅中文</option>
                 <option value="en">仅英文</option>
               </select>
@@ -2071,7 +2393,7 @@ function App() {
                   onClick={() => void generateArticle({ refreshTarget: latestRecord ? 'body' : 'initial', preserveNotice: Boolean(latestRecord) })}
                   disabled={isBusy || (!latestRecord && (!selectedTitle || !articlePromptId))}
                 >
-                  {isArticleProcessing && articleRefreshTarget !== 'tdk' ? '重新生成中...' : '生成正文 + TDK'}
+                  {isOutputProcessing && articleRefreshTarget !== 'tdk' ? '重新生成中...' : '生成正文 + TDK'}
                 </button>
                 <button
                   type="button"
@@ -2081,6 +2403,16 @@ function App() {
                 >
                   重新生成标题
                 </button>
+                {latestRecord ? (
+                  <button
+                    type="button"
+                    className="save-local-button"
+                    onClick={() => void exportRecord(latestRecord.id, exportFormat)}
+                    disabled={isBusy}
+                  >
+                    保存到本地
+                  </button>
+                ) : null}
               </>
             ) : (
               <button type="button" onClick={() => void generateTitleOptions()} disabled={isBusy || !direction || !titlePromptId}>
@@ -2179,12 +2511,11 @@ function App() {
                   className={selectedTitle?.zh === item.zh ? 'title-card active' : 'title-card'}
                   onClick={() => setSelectedTitle(item)}
                 >
-                  <div>
+                  <div className="title-card-copy">
                     <p className="title-zh">{item.zh}</p>
                     <p className="title-en">{item.en}</p>
-                    <span>{item.reason}</span>
                   </div>
-                  <button type="button" className="ghost" onClick={(event) => {
+                  <button type="button" className="ghost title-refresh" onClick={(event) => {
                     event.stopPropagation()
                     void refreshSingleTitle(index)
                   }}>
@@ -2203,24 +2534,45 @@ function App() {
               {outputStatus.text}
             </div>
           ) : null}
+          {timingSnapshot?.text ? <div className="output-timing-summary">{`${timingSnapshot.operationLabel} · ${timingSnapshot.text}`}</div> : null}
           {latestRecord ? (
             <section className="result-grid result-split">
               <article className="result-card body-card">
                 <div className="panel-head compact">
                   <div>
                     <p className="panel-kicker">BODY</p>
-                    <h3>{showZhOutput ? latestRecord.selectedTitleZh : latestRecord.selectedTitleEn}</h3>
+                    <h3>{bodyTitle}</h3>
                   </div>
                 </div>
                 <div className="panel-actions output-actions">
-                  {!bodyRefreshing && showZhOutput ? (
-                    <button type="button" className="ghost" onClick={() => void copyText('中文正文', latestRecord.bodyZh)}>
+                  {hasZhBody ? (
+                    <button
+                      type="button"
+                      className="ghost"
+                      onClick={() => void copyArticle('中文正文', latestRecord.bodyZh, latestRecord.selectedTitleZh)}
+                      disabled={isBusy && !translationRefreshing}
+                    >
                       复制中文
                     </button>
                   ) : null}
-                  {!bodyRefreshing && showEnOutput ? (
-                    <button type="button" className="ghost" onClick={() => void copyText('英文正文', latestRecord.bodyEn)}>
+                  {hasEnBody ? (
+                    <button
+                      type="button"
+                      className="ghost"
+                      onClick={() => void copyArticle('英文正文', latestRecord.bodyEn, latestRecord.selectedTitleEn)}
+                      disabled={isBusy && !translationRefreshing}
+                    >
                       复制英文
+                    </button>
+                  ) : null}
+                  {!bodyRefreshing && translationTarget ? (
+                    <button
+                      type="button"
+                      className="ghost"
+                      onClick={() => void translateLatestRecord(translationTarget)}
+                      disabled={isBusy}
+                    >
+                      {translationTarget === 'zh' ? '生成中文翻译' : '生成英文翻译'}
                     </button>
                   ) : null}
                   <button
@@ -2231,16 +2583,13 @@ function App() {
                   >
                     {bodyRefreshing ? '重新生成中...' : '重新生成正文'}
                   </button>
-                  <button type="button" className="ghost" onClick={() => void exportRecord(latestRecord.id, exportFormat)} disabled={isBusy}>
-                    重新导出
-                  </button>
                 </div>
                 <div className="stacked-output">
                   {bodyRefreshing ? (
                     <section className="output-loading">
-                      <p>重新生成中...</p>
+                      <p>{processingLabel}</p>
                       <div className="inline-progress">
-                        {processLabels.article.map((item, index) => (
+                        {currentProcessSteps.map((item, index) => (
                           <div
                             key={item}
                             className={[
@@ -2258,16 +2607,47 @@ function App() {
                       </div>
                     </section>
                   ) : null}
-                  {!bodyRefreshing && showZhOutput ? (
+                  {hasZhBody ? (
                     <section className="output-block">
                       <p className="output-block-title">中文正文</p>
-                      <div className="copy-block">{latestRecord.bodyZh}</div>
+                      <div
+                        className="copy-block copy-block-rich"
+                        dangerouslySetInnerHTML={{ __html: buildRichTextHtml(latestRecord.bodyZh) }}
+                      />
                     </section>
                   ) : null}
-                  {!bodyRefreshing && showEnOutput ? (
+                  {hasEnBody ? (
                     <section className="output-block">
                       <p className="output-block-title">英文正文</p>
-                      <div className="copy-block">{latestRecord.bodyEn}</div>
+                      <div
+                        className="copy-block copy-block-rich"
+                        dangerouslySetInnerHTML={{ __html: buildRichTextHtml(latestRecord.bodyEn) }}
+                      />
+                    </section>
+                  ) : null}
+                  {translationRefreshing && translationTarget ? (
+                    <section className="output-block">
+                      <p className="output-block-title">{translationTarget === 'zh' ? '中文翻译生成中' : '英文翻译生成中'}</p>
+                      <div className="output-loading compact">
+                        <p>{processingLabel}</p>
+                        <div className="inline-progress">
+                          {currentProcessSteps.map((item, index) => (
+                            <div
+                              key={item}
+                              className={[
+                                'inline-progress-step',
+                                index < processIndex ? 'done' : '',
+                                index === processIndex ? 'active' : '',
+                              ]
+                                .filter(Boolean)
+                                .join(' ')}
+                            >
+                              <span>{String(index + 1).padStart(2, '0')}</span>
+                              <strong>{item}</strong>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
                     </section>
                   ) : null}
                 </div>
@@ -2281,7 +2661,7 @@ function App() {
                   </div>
                 </div>
                 <div className="panel-actions output-actions">
-                  {!tdkRefreshing && showZhOutput ? (
+                  {!tdkRefreshing && hasZhTdk ? (
                     <button
                       type="button"
                       className="ghost"
@@ -2295,7 +2675,7 @@ function App() {
                       复制中文
                     </button>
                   ) : null}
-                  {!tdkRefreshing && showEnOutput ? (
+                  {!tdkRefreshing && hasEnTdk ? (
                     <button
                       type="button"
                       className="ghost"
@@ -2315,15 +2695,15 @@ function App() {
                     onClick={() => void regenerateLatestRecord('tdk')}
                     disabled={isBusy}
                   >
-                    {articleRefreshTarget === 'tdk' && isArticleProcessing ? '重新生成中...' : '重新生成TDK'}
+                    {articleRefreshTarget === 'tdk' && isOutputProcessing ? '重新生成中...' : '重新生成TDK'}
                   </button>
                 </div>
                 <div className="stacked-output">
                   {tdkRefreshing ? (
                     <section className="output-loading">
-                      <p>重新生成中...</p>
+                      <p>{processingLabel}</p>
                       <div className="inline-progress">
-                        {processLabels.article.map((item, index) => (
+                        {currentProcessSteps.map((item, index) => (
                           <div
                             key={item}
                             className={[
@@ -2341,7 +2721,7 @@ function App() {
                       </div>
                     </section>
                   ) : null}
-                  {!tdkRefreshing && showZhOutput ? (
+                  {!tdkRefreshing && hasZhTdk ? (
                     <section className="output-block">
                       <p className="output-block-title">中文 TDK</p>
                       <dl className="tdk-list">
@@ -2360,7 +2740,7 @@ function App() {
                       </dl>
                     </section>
                   ) : null}
-                  {!tdkRefreshing && showEnOutput ? (
+                  {!tdkRefreshing && hasEnTdk ? (
                     <section className="output-block">
                       <p className="output-block-title">英文 TDK</p>
                       <dl className="tdk-list">
@@ -2384,11 +2764,11 @@ function App() {
             </section>
           ) : (
             <div className="placeholder-box large">
-              {isArticleProcessing ? (
+              {isOutputProcessing ? (
                 <>
-                  <p>正在生成正文与 TDK。</p>
+                  <p>{processingLabel}</p>
                   <div className="inline-progress">
-                    {processLabels.article.map((item, index) => (
+                    {currentProcessSteps.map((item, index) => (
                       <div
                         key={item}
                         className={[
@@ -2406,7 +2786,7 @@ function App() {
                   </div>
                 </>
               ) : (
-                <p>正文、TDK 和导出路径会显示在这里。</p>
+                <p>正文、TDK、翻译结果和保存状态会显示在这里。</p>
               )}
             </div>
           )}
@@ -2482,7 +2862,7 @@ function App() {
                   <button
                     type="button"
                     className="ghost"
-                    onClick={() => void navigator.clipboard.writeText(item.bodyZh)}
+                    onClick={() => void copyArticle('中文正文', item.bodyZh, item.selectedTitleZh)}
                   >
                     复制中文
                   </button>

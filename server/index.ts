@@ -16,7 +16,8 @@ import { z } from 'zod'
 
 type JsonRecord = Record<string, unknown>
 type ProcessorMode = 'llm' | 'rule'
-type OutputLanguage = 'zh-en' | 'zh' | 'en'
+type OutputLanguage = 'zh' | 'en'
+type ExportOutputLanguage = 'zh-en' | 'zh' | 'en'
 type ProductDraft = {
   name: string
   content: string
@@ -92,6 +93,8 @@ type HistoryRecord = {
   exportDocxPath: string | null
   createdAt: string
 }
+
+type OperationTimings = Record<string, number>
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const ROOT_DIR = path.resolve(__dirname, '..')
@@ -732,8 +735,7 @@ app.post('/api/generate/titles', async (req, res) => {
   const settings = getSettings()
   const titlePrompt = pickTitlePrompt(payload.direction, payload.titlePromptId ?? null)
   const product = payload.productId ? getProductById(payload.productId) : null
-  const company = getCompanyProfile()
-  const recentEnglishTitles = getRecentEnglishTitleHistory(20)
+  const recentEnglishTitles = getRecentEnglishTitleHistory(10)
 
   if (!settings.apiUrl || !settings.apiKey || !settings.modelName) {
     res.status(400).json({ error: '请先在设置区填写 API URL、API Key 和模型名称。' })
@@ -745,7 +747,6 @@ app.post('/api/generate/titles', async (req, res) => {
     direction: payload.direction,
     titlePrompt,
     keyword: payload.keyword?.trim() || '',
-    company,
     product,
     recentEnglishTitles,
   })
@@ -767,7 +768,7 @@ app.post('/api/generate/article', async (req, res) => {
       direction: z.string().trim().min(1),
       promptTemplateId: z.number().int().positive().nullable().optional(),
       keyword: z.string().trim().optional(),
-      outputLanguage: z.enum(['zh-en', 'zh', 'en']).default('zh-en'),
+      outputLanguage: z.enum(['zh', 'en']).default('zh'),
       productId: z.number().int().positive().nullable(),
       mode: z.enum(['standard', 'brutal']).default('standard'),
       titles: z.array(
@@ -782,7 +783,6 @@ app.post('/api/generate/article', async (req, res) => {
         en: z.string().trim().min(1),
       }),
       quantity: z.number().int().min(1).max(10).default(1),
-      exportFormat: z.enum(['md', 'docx']),
     })
     .parse(req.body)
 
@@ -800,10 +800,9 @@ app.post('/api/generate/article', async (req, res) => {
   }
 
   const createdRecords: HistoryRecord[] = []
-  const savedPaths: string[] = []
-
+  let latestTimings: OperationTimings | null = null
   for (let index = 0; index < payload.quantity; index += 1) {
-    const article = await generateArticle({
+    const article = await generateArticleBodyOnly({
       settings,
       direction: payload.direction,
       keyword: payload.keyword?.trim() || '',
@@ -811,9 +810,9 @@ app.post('/api/generate/article', async (req, res) => {
       company,
       product,
       template,
-      rule,
       selectedTitle: payload.selectedTitle,
     })
+    latestTimings = article.timings
 
     const result = db
       .prepare(
@@ -832,12 +831,12 @@ app.post('/api/generate/article', async (req, res) => {
         payload.selectedTitle.en,
         article.bodyZh,
         article.bodyEn,
-        article.tdk.titleZh,
-        article.tdk.titleEn,
-        article.tdk.descriptionZh,
-        article.tdk.descriptionEn,
-        article.tdk.keywordsZh,
-        article.tdk.keywordsEn,
+        '',
+        '',
+        '',
+        '',
+        '',
+        '',
         template?.id ?? null,
         rule?.id ?? null,
         JSON.stringify({
@@ -848,23 +847,19 @@ app.post('/api/generate/article', async (req, res) => {
           variantIndex: index + 1,
           outputLanguage: payload.outputLanguage,
           processor: 'llm',
+          ...buildTimingMeta('body', article.timings),
         }),
       )
 
     const historyId = Number(result.lastInsertRowid)
-    const savedPath = await exportHistory(historyId, payload.exportFormat)
-    const fieldName = payload.exportFormat === 'md' ? 'export_md_path' : 'export_docx_path'
-    db.prepare(`UPDATE history SET ${fieldName} = ? WHERE id = ?`).run(savedPath, historyId)
     createdRecords.push(getHistoryById(historyId))
-    savedPaths.push(savedPath)
   }
 
   res.json({
     records: createdRecords,
     record: createdRecords[0] ?? null,
-    savedPath: savedPaths[0] ?? '',
-    savedPaths,
     history: getHistory(),
+    timings: latestTimings,
   })
 })
 
@@ -899,8 +894,9 @@ app.post('/api/history/:id/regenerate', async (req, res) => {
     return
   }
 
+  let responseTimings: OperationTimings
   if (payload.target === 'body') {
-    const article = await generateArticle({
+    const article = await generateArticleBodyOnly({
       settings,
       direction: record.direction,
       keyword,
@@ -908,9 +904,31 @@ app.post('/api/history/:id/regenerate', async (req, res) => {
       company,
       product,
       template,
-      rule,
       selectedTitle,
     })
+
+    const dbStartedAt = performance.now()
+    db.prepare(
+      `UPDATE history
+       SET body_zh = ?, body_en = ?,
+           tdk_title_zh = '', tdk_title_en = '',
+           tdk_description_zh = '', tdk_description_en = '',
+           tdk_keywords_zh = '', tdk_keywords_en = '',
+           prompt_template_id = ?, tdk_rule_id = ?
+       WHERE id = ?`,
+    ).run(
+      article.bodyZh,
+      article.bodyEn,
+      template?.id ?? null,
+      rule?.id ?? null,
+      historyId,
+    )
+
+    responseTimings = {
+      ...article.timings,
+      dbMs: roundTimingMs(performance.now() - dbStartedAt),
+    }
+    responseTimings.totalMs = roundTimingMs((responseTimings.totalMs ?? 0) + responseTimings.dbMs)
 
     const nextMeta = {
       ...record.meta,
@@ -920,58 +938,36 @@ app.post('/api/history/:id/regenerate', async (req, res) => {
       keyword,
       outputLanguage,
       processor: 'llm',
+      ...buildTimingMeta('body', responseTimings),
     }
-
     db.prepare(
       `UPDATE history
-       SET body_zh = ?, body_en = ?,
-           tdk_title_zh = ?, tdk_title_en = ?,
-           tdk_description_zh = ?, tdk_description_en = ?,
-           tdk_keywords_zh = ?, tdk_keywords_en = ?,
-           prompt_template_id = ?, tdk_rule_id = ?, meta = ?
+       SET meta = ?
        WHERE id = ?`,
-    ).run(
-      article.bodyZh,
-      article.bodyEn,
-      article.tdk.titleZh,
-      article.tdk.titleEn,
-      article.tdk.descriptionZh,
-      article.tdk.descriptionEn,
-      article.tdk.keywordsZh,
-      article.tdk.keywordsEn,
-      template?.id ?? null,
-      rule?.id ?? null,
-      JSON.stringify(nextMeta),
-      historyId,
-    )
+    ).run(JSON.stringify(nextMeta), historyId)
   } else {
-    const tdk = await generateTdkForExistingBody({
-      settings,
-      direction: record.direction,
-      keyword,
-      outputLanguage,
-      selectedTitle,
-      bodyZh: record.bodyZh,
-      bodyEn: record.bodyEn,
-      template,
-      rule,
-    })
+    const timings: OperationTimings = {}
+    const startedAt = performance.now()
+    const tdk = await measureTiming(timings, 'tdkMs', () =>
+      generateTdkForExistingBody({
+        settings,
+        direction: record.direction,
+        keyword,
+        outputLanguage,
+        selectedTitle,
+        bodyZh: outputLanguage === 'zh' ? record.bodyZh : '',
+        bodyEn: outputLanguage === 'en' ? record.bodyEn : '',
+        template,
+      }),
+    )
 
-    const nextMeta = {
-      ...record.meta,
-      promptName: template?.name ?? null,
-      ruleName: rule?.name ?? null,
-      keyword,
-      outputLanguage,
-      processor: 'llm',
-    }
-
+    const dbStartedAt = performance.now()
     db.prepare(
       `UPDATE history
        SET tdk_title_zh = ?, tdk_title_en = ?,
            tdk_description_zh = ?, tdk_description_en = ?,
            tdk_keywords_zh = ?, tdk_keywords_en = ?,
-           prompt_template_id = ?, tdk_rule_id = ?, meta = ?
+           prompt_template_id = ?, tdk_rule_id = ?
        WHERE id = ?`,
     ).run(
       tdk.titleZh,
@@ -982,14 +978,158 @@ app.post('/api/history/:id/regenerate', async (req, res) => {
       tdk.keywordsEn,
       template?.id ?? null,
       rule?.id ?? null,
-      JSON.stringify(nextMeta),
       historyId,
     )
+    timings.dbMs = roundTimingMs(performance.now() - dbStartedAt)
+    timings.totalMs = roundTimingMs(performance.now() - startedAt)
+    responseTimings = timings
+
+    const nextMeta = {
+      ...record.meta,
+      promptName: template?.name ?? null,
+      ruleName: rule?.name ?? null,
+      keyword,
+      outputLanguage,
+      processor: 'llm',
+      ...buildTimingMeta('tdk', responseTimings),
+    }
+    db.prepare(
+      `UPDATE history
+       SET meta = ?
+       WHERE id = ?`,
+    ).run(JSON.stringify(nextMeta), historyId)
   }
 
   res.json({
     record: getHistoryById(historyId),
     history: getHistory(),
+    timings: responseTimings,
+  })
+})
+
+app.post('/api/history/:id/translate', async (req, res) => {
+  const historyId = Number(req.params.id)
+  if (!Number.isFinite(historyId)) {
+    res.status(400).json({ error: '无效的历史记录 ID。' })
+    return
+  }
+
+  const payload = z
+    .object({
+      targetLanguage: z.enum(['zh', 'en']),
+    })
+    .parse(req.body)
+
+  const record = getHistoryById(historyId)
+  const settings = getSettings()
+  const template = record.promptTemplateId
+    ? getPromptTemplates().find((item) => item.id === record.promptTemplateId) ?? pickPromptTemplate(record.direction)
+    : pickPromptTemplate(record.direction)
+  const keyword = typeof record.meta.keyword === 'string' ? record.meta.keyword : ''
+  const originalLanguage = resolveOutputLanguage(record.meta.outputLanguage)
+
+  if (!settings.apiUrl || !settings.apiKey || !settings.modelName) {
+    res.status(400).json({ error: '请先完成大模型配置。' })
+    return
+  }
+
+  if (payload.targetLanguage === originalLanguage) {
+    res.status(400).json({ error: '当前记录本身就是这个语言，无需再次翻译。' })
+    return
+  }
+
+  const timings: OperationTimings = {}
+  const startedAt = performance.now()
+
+  if (payload.targetLanguage === 'en') {
+    if (!record.bodyZh.trim()) {
+      res.status(400).json({ error: '当前没有可用的中文正文，无法生成英文翻译。' })
+      return
+    }
+
+    const bodyStartedAt = performance.now()
+    const tdkStartedAt = performance.now()
+    const bodyPromise = translateArticleBodyToEnglish({
+      settings,
+      bodyZh: record.bodyZh,
+    }).then((value) => {
+      timings.translateBodyMs = roundTimingMs(performance.now() - bodyStartedAt)
+      return value
+    })
+    const tdkPromise = translateChineseTdkToEnglish({
+      settings,
+      titleZh: record.tdkTitleZh,
+      descriptionZh: record.tdkDescriptionZh,
+      keywordsZh: record.tdkKeywordsZh,
+    }).then((value) => {
+      timings.translateTdkMs = roundTimingMs(performance.now() - tdkStartedAt)
+      return value
+    })
+    const [bodyEn, enTdk] = await Promise.all([bodyPromise, tdkPromise])
+
+    const dbStartedAt = performance.now()
+    db.prepare(
+      `UPDATE history
+       SET body_en = ?, tdk_title_en = ?, tdk_description_en = ?, tdk_keywords_en = ?
+       WHERE id = ?`,
+    ).run(bodyEn, enTdk.titleEn, enTdk.descriptionEn, enTdk.keywordsEn, historyId)
+    timings.dbMs = roundTimingMs(performance.now() - dbStartedAt)
+  } else {
+    if (!record.bodyEn.trim()) {
+      res.status(400).json({ error: '当前没有可用的英文正文，无法生成中文翻译。' })
+      return
+    }
+
+    const bodyStartedAt = performance.now()
+    const tdkStartedAt = performance.now()
+    const bodyPromise = translateArticleBodyToChinese({
+      settings,
+      bodyEn: record.bodyEn,
+    }).then((value) => {
+      timings.translateBodyMs = roundTimingMs(performance.now() - bodyStartedAt)
+      return value
+    })
+    const tdkPromise = translateEnglishTdkToChinese({
+      settings,
+      titleEn: record.tdkTitleEn,
+      descriptionEn: record.tdkDescriptionEn,
+      keywordsEn: record.tdkKeywordsEn,
+    }).then((value) => {
+      timings.translateTdkMs = roundTimingMs(performance.now() - tdkStartedAt)
+      return value
+    })
+    const [bodyZh, zhTdk] = await Promise.all([bodyPromise, tdkPromise])
+
+    const dbStartedAt = performance.now()
+    db.prepare(
+      `UPDATE history
+       SET body_zh = ?, tdk_title_zh = ?, tdk_description_zh = ?, tdk_keywords_zh = ?
+       WHERE id = ?`,
+    ).run(bodyZh, zhTdk.titleZh, zhTdk.descriptionZh, zhTdk.keywordsZh, historyId)
+    timings.dbMs = roundTimingMs(performance.now() - dbStartedAt)
+  }
+
+  timings.totalMs = roundTimingMs(performance.now() - startedAt)
+  db.prepare(
+    `UPDATE history
+     SET meta = ?
+     WHERE id = ?`,
+  ).run(
+    JSON.stringify({
+      ...record.meta,
+      promptName: template?.name ?? null,
+      keyword,
+      outputLanguage: originalLanguage,
+      processor: 'llm',
+      ...buildTimingMeta('translate', timings),
+    }),
+    historyId,
+  )
+
+  res.json({
+    record: getHistoryById(historyId),
+    history: getHistory(),
+    timings,
   })
 })
 
@@ -999,6 +1139,7 @@ app.post('/api/generate/batch', async (req, res) => {
       quantity: z.number().int().min(1).max(50),
       directionPool: z.array(z.string().trim()).min(1),
       productIds: z.array(z.number().int().positive()).default([]),
+      outputLanguage: z.enum(['zh', 'en']).default('zh'),
       exportFormat: z.enum(['md', 'docx']),
     })
     .parse(req.body)
@@ -1020,9 +1161,8 @@ app.post('/api/generate/batch', async (req, res) => {
       direction,
       titlePrompt,
       keyword: '',
-      company: getCompanyProfile(),
       product,
-      recentEnglishTitles: getRecentEnglishTitleHistory(20),
+      recentEnglishTitles: getRecentEnglishTitleHistory(10),
     })
 
     const selectedTitle = titles[0]
@@ -1033,11 +1173,10 @@ app.post('/api/generate/batch', async (req, res) => {
       settings: getSettings(),
       direction,
       keyword: '',
-      outputLanguage: 'zh-en',
+      outputLanguage: payload.outputLanguage,
       company: getCompanyProfile(),
       product,
       template,
-      rule,
       selectedTitle,
     })
 
@@ -1070,7 +1209,7 @@ app.post('/api/generate/batch', async (req, res) => {
           batchIndex: index + 1,
           promptName: template?.name ?? null,
           ruleName: rule?.name ?? null,
-          outputLanguage: 'zh-en',
+          outputLanguage: payload.outputLanguage,
         }),
       )
 
@@ -1272,7 +1411,7 @@ function getHistory(): HistoryRecord[] {
   return rows.map(mapHistoryRecord)
 }
 
-function getRecentEnglishTitleHistory(limit = 20) {
+function getRecentEnglishTitleHistory(limit = 10) {
   const rows = db
     .prepare(
       `SELECT selected_title_en
@@ -1398,31 +1537,12 @@ function buildBodyLengthGuidance(bodyPrompt: string, outputLanguage: OutputLangu
 
   if (hasExplicitLength) {
     return `
-- 如果“正文要求”里已经明确写了字数、篇幅、单词数或 token 要求，以正文要求为准
-- 无论正文要求如何，中文正文最大不能超过 2000 个中文字符
-- 结构保持清晰，优先满足 SEO/GEO 的可读性和信息密度`
+- 如果“正文要求”里已经明确写了长度要求，以正文要求为准
+- 中文正文最大不超过 2000 个中文字符`
   }
 
   return `
-- 若“正文要求”未明确写长度，请按 SEO/GEO 友好的较长正文输出
-- 开头前 1-2 句先给出结论、答案或推荐结果，再展开说明
-- 中文正文建议控制在 900-1600 个中文字符之间，最大不超过 2000 个中文字符
-- ${outputLanguage === 'zh' ? '当前只输出中文正文' : '英文版保持与中文正文相近的信息密度，目标约 500-1000 tokens'}
-- 分 4-6 段，避免空泛铺陈，优先写清结果、理由、场景和选择建议`
-}
-
-function buildTdkRuleBlock(rule: TdkRule | null) {
-  if (!rule) {
-    return ''
-  }
-
-  return `
-TDK规则：
-- Title：${rule.titleRule || '无'}
-- Description：${rule.descriptionRule || '无'}
-- Keywords：${rule.keywordsRule || '无'}
-- 必带词：${rule.mustInclude.join(' / ') || '无'}
-- 禁用词：${rule.forbiddenWords.join(' / ') || '无'}`
+- 若“正文要求”未明确写长度，${outputLanguage === 'zh' ? '中文正文控制在 900-1600 个中文字符之间，最大不超过 2000 个中文字符' : '英文正文控制在适中的 SEO 文章长度'}`
 }
 
 function safeJson<T>(value: string, fallback: T): T {
@@ -1747,8 +1867,7 @@ async function llmRequest({
         messages: [
           {
             role: 'system',
-            content:
-              '你是 SEO 内容策略助手。严格遵循要求输出，不写多余前后缀。除非要求解释，否则只输出 JSON。',
+            content: '你是内容生成助手。严格遵循用户要求输出，不写多余前后缀。',
           },
           {
             role: 'user',
@@ -1808,6 +1927,24 @@ async function llmRequest({
   throw new Error('LLM 返回内容无法解析。')
 }
 
+function roundTimingMs(value: number) {
+  return Number(value.toFixed(1))
+}
+
+async function measureTiming<T>(timings: OperationTimings, key: string, job: () => Promise<T>) {
+  const startedAt = performance.now()
+  const result = await job()
+  timings[key] = roundTimingMs(performance.now() - startedAt)
+  return result
+}
+
+function buildTimingMeta(operation: 'article' | 'body' | 'tdk' | 'translate', timings: OperationTimings) {
+  return {
+    lastOperation: operation,
+    lastOperationTimings: timings,
+  }
+}
+
 function extractJsonBlock(text: string) {
   const fenced = text.match(/```json\s*([\s\S]*?)```/i)
   if (fenced) {
@@ -1833,7 +1970,6 @@ async function generateTitles({
   direction,
   titlePrompt,
   keyword,
-  company,
   product,
   recentEnglishTitles,
 }: {
@@ -1841,34 +1977,29 @@ async function generateTitles({
   direction: string
   titlePrompt: TitlePromptTemplate | null
   keyword: string
-  company: ReturnType<typeof getCompanyProfile>
   product: Product | null
   recentEnglishTitles: string[]
 }) {
   const recentEnglishTitleBlock = recentEnglishTitles.length
     ? recentEnglishTitles.map((item, index) => `${index + 1}. ${item}`).join('\n')
-    : '暂无最近历史英文标题'
+    : 'None'
   const prompt = `
-你现在要为一个 SEO 工作流生成标题候选。
+为当前主题生成中英双语标题候选。
 
 文案方向：${direction}
 关键词：${keyword || '未指定'}
-标题指令：${titlePrompt?.prompt || '生成 SEO 友好的中英双语标题'}
-
-公司资料：
-- 优势：${company.strengths.join(' / ') || '暂无'}
-- 语气：${company.tone || '专业'}
-- 场景：${company.scenarios.join(' / ') || '暂无'}
+用户标题要求：
+${titlePrompt?.prompt || '生成中英双语标题'}
 
 产品资料：
 - 产品名：${product?.name || '未指定'}
-- 内容：${product?.content || '未指定'}
+- 内容：${product?.content.slice(0, 240) || '未指定'}
 - 关键词：${product?.keywords.join(' / ') || '暂无'}
 
-最近 20 条历史英文标题（新标题不得与这些标题重复，也尽量避免语义近似）：
+最近 10 条历史英文标题，请避免完全重复：
 ${recentEnglishTitleBlock}
 
-请只输出严格 JSON 数组，长度为 4。要求 4 个标题彼此也必须明显不同，每项格式如下：
+请只输出严格 JSON 数组，长度为 4，每项格式如下：
 [
   { "zh": "中文标题", "en": "English title", "reason": "简短理由" }
 ]
@@ -2011,7 +2142,6 @@ async function generateArticle({
   company,
   product,
   template,
-  rule,
   selectedTitle,
 }: {
   settings: ReturnType<typeof getSettings>
@@ -2021,48 +2151,138 @@ async function generateArticle({
   company: ReturnType<typeof getCompanyProfile>
   product: Product | null
   template: PromptTemplate | null
-  rule: TdkRule | null
   selectedTitle: { zh: string; en: string }
 }) {
-  const articlePackageZh = await generateArticleBody({
-    settings,
-    direction,
-    keyword,
-    outputLanguage,
-    company,
-    product,
-    template,
-    selectedTitle,
-  })
+  const timings: OperationTimings = {}
+  const startedAt = performance.now()
 
-  let bodyEn = ''
-  if (outputLanguage !== 'zh') {
-    bodyEn = await translateArticleBodyToEnglish({
+  if (outputLanguage === 'zh') {
+    const articlePackageZh = await measureTiming(timings, 'bodyMs', () =>
+      generateArticleBody({
+        settings,
+        direction,
+        keyword,
+        outputLanguage,
+        company,
+        product,
+        template,
+        selectedTitle,
+      }),
+    )
+    const tdk = await measureTiming(timings, 'tdkMs', () =>
+      generateTdkForExistingBody({
+        settings,
+        direction,
+        keyword,
+        outputLanguage,
+        selectedTitle,
+        bodyZh: articlePackageZh.bodyZh,
+        bodyEn: '',
+        template,
+      }),
+    )
+    timings.totalMs = roundTimingMs(performance.now() - startedAt)
+
+    return {
+      bodyZh: articlePackageZh.bodyZh,
+      bodyEn: '',
+      tdk,
+      timings,
+    }
+  }
+
+  const bodyEn = await measureTiming(timings, 'bodyMs', () =>
+    generateEnglishArticleBody({
       settings,
       direction,
       keyword,
+      company,
+      product,
+      template,
       selectedTitle,
-      bodyZh: articlePackageZh.bodyZh,
-      bodyPrompt: template?.bodyPrompt || '',
-    })
-  }
-
-  const tdk = await generateTdkForExistingBody({
-    settings,
-    direction,
-    keyword,
-    outputLanguage,
-    selectedTitle,
-    bodyZh: articlePackageZh.bodyZh,
-    bodyEn,
-    template,
-    rule,
-  })
+    }),
+  )
+  const tdk = await measureTiming(timings, 'tdkMs', () =>
+    generateTdkForExistingBody({
+      settings,
+      direction,
+      keyword,
+      outputLanguage,
+      selectedTitle,
+      bodyZh: '',
+      bodyEn,
+      template,
+    }),
+  )
+  timings.totalMs = roundTimingMs(performance.now() - startedAt)
 
   return {
-    bodyZh: articlePackageZh.bodyZh,
+    bodyZh: '',
     bodyEn,
     tdk,
+    timings,
+  }
+}
+
+async function generateArticleBodyOnly({
+  settings,
+  direction,
+  keyword,
+  outputLanguage,
+  company,
+  product,
+  template,
+  selectedTitle,
+}: {
+  settings: ReturnType<typeof getSettings>
+  direction: string
+  keyword: string
+  outputLanguage: OutputLanguage
+  company: ReturnType<typeof getCompanyProfile>
+  product: Product | null
+  template: PromptTemplate | null
+  selectedTitle: { zh: string; en: string }
+}) {
+  const timings: OperationTimings = {}
+  const startedAt = performance.now()
+
+  if (outputLanguage === 'zh') {
+    const articlePackageZh = await measureTiming(timings, 'bodyMs', () =>
+      generateArticleBody({
+        settings,
+        direction,
+        keyword,
+        outputLanguage,
+        company,
+        product,
+        template,
+        selectedTitle,
+      }),
+    )
+    timings.totalMs = roundTimingMs(performance.now() - startedAt)
+    return {
+      bodyZh: articlePackageZh.bodyZh,
+      bodyEn: '',
+      timings,
+    }
+  }
+
+  const bodyEn = await measureTiming(timings, 'bodyMs', () =>
+    generateEnglishArticleBody({
+      settings,
+      direction,
+      keyword,
+      company,
+      product,
+      template,
+      selectedTitle,
+    }),
+  )
+  timings.totalMs = roundTimingMs(performance.now() - startedAt)
+  return {
+    bodyZh: '',
+    bodyEn,
+    timings,
   }
 }
 
@@ -2075,7 +2295,6 @@ async function generateTdkForExistingBody({
   bodyZh,
   bodyEn,
   template,
-  rule,
 }: {
   settings: ReturnType<typeof getSettings>
   direction: string
@@ -2085,48 +2304,43 @@ async function generateTdkForExistingBody({
   bodyZh: string
   bodyEn: string
   template: PromptTemplate | null
-  rule: TdkRule | null
 }) {
-  const zhTdk =
-    outputLanguage !== 'en'
-      ? await generateChineseTdk({
-          settings,
-          direction,
-          keyword,
-          selectedTitle,
-          bodyZh,
-          template,
-          rule,
-        })
-      : {
-          titleZh: '',
-          descriptionZh: '',
-          keywordsZh: '',
-        }
+  if (outputLanguage === 'zh') {
+    const zhTdk = await generateChineseTdk({
+      settings,
+      direction,
+      keyword,
+      selectedTitle,
+      bodyZh,
+      template,
+    })
 
-  const enTdk =
-    outputLanguage !== 'zh'
-      ? await generateEnglishTdk({
-          settings,
-          direction,
-          keyword,
-          selectedTitle,
-          bodyZh,
-          bodyEn,
-          zhTdk,
-        })
-      : {
-          titleEn: '',
-          descriptionEn: '',
-          keywordsEn: '',
-        }
+    return {
+      titleZh: zhTdk.titleZh,
+      titleEn: '',
+      descriptionZh: zhTdk.descriptionZh,
+      descriptionEn: '',
+      keywordsZh: zhTdk.keywordsZh,
+      keywordsEn: '',
+    }
+  }
+
+  const enTdk = await generateEnglishTdk({
+    settings,
+    direction,
+    keyword,
+    selectedTitle,
+    bodyZh,
+    bodyEn,
+    template,
+  })
 
   return {
-    titleZh: zhTdk.titleZh,
+    titleZh: '',
     titleEn: enTdk.titleEn,
-    descriptionZh: zhTdk.descriptionZh,
+    descriptionZh: '',
     descriptionEn: enTdk.descriptionEn,
-    keywordsZh: zhTdk.keywordsZh,
+    keywordsZh: '',
     keywordsEn: enTdk.keywordsEn,
   }
 }
@@ -2138,7 +2352,6 @@ async function generateChineseTdk({
   selectedTitle,
   bodyZh,
   template,
-  rule,
 }: {
   settings: ReturnType<typeof getSettings>
   direction: string
@@ -2146,11 +2359,10 @@ async function generateChineseTdk({
   selectedTitle: { zh: string; en: string }
   bodyZh: string
   template: PromptTemplate | null
-  rule: TdkRule | null
 }) {
-  const tdkRuleBlock = buildTdkRuleBlock(rule)
   const prompt = `
-你现在只负责根据现有中文正文与标题生成中文 TDK，不要重写正文，不要输出英文，不要输出解释。
+你现在只负责根据现有中文正文与标题生成中文 TDK。
+不要重写正文，不要输出英文，不要输出解释。
 
 文案方向：${direction}
 关键词：${keyword || '未指定'}
@@ -2159,10 +2371,8 @@ async function generateChineseTdk({
 中文正文：
 ${bodyZh}
 
-TDK要求：
+用户 TDK 要求：
 ${template?.tdkPrompt || '输出中文 TDK'}
-
-${tdkRuleBlock}
 
 请严格按以下标签输出，不要输出其他说明：
 [TDK_TITLE_ZH]
@@ -2180,7 +2390,7 @@ ${tdkRuleBlock}
     settings,
     prompt,
     timeoutMs: settings.articleTimeoutSec * 1000,
-    maxTokens: 420,
+    maxTokens: 260,
   })
 
   const titleZh = extractTaggedBlock(raw, 'TDK_TITLE_ZH')
@@ -2234,11 +2444,8 @@ async function generateArticleBody({
   const lengthGuidance = buildBodyLengthGuidance(template?.bodyPrompt || '', outputLanguage)
 
   const prompt = `
-你现在只负责输出中文 SEO 正文，不要输出 TDK，不要输出英文，不要输出解释。
-注意：即使下方模板提到“双语”“中英”“英文”或“翻译”，本阶段也一律忽略；本阶段只能输出中文。
-注意：如果公司资料或产品资料里出现英文内容，你必须先理解后改写成中文，不能把英文原句直接写进 [BODY_ZH]。
-注意：[BODY_ZH] 里不能出现完整英文段落，不能把中文段落和英文段落混排。
-注意：正文开头必须先给出答案、结果、推荐结论或核心判断，再展开细节；这是 SEO/GEO 的优先要求。
+你现在只负责输出中文正文，不要输出 TDK，不要输出英文，不要输出解释。
+正文开头先给出结论、答案、推荐结果或核心判断，再展开正文。
 
 文案方向：${direction}
 关键词：${keyword || '未指定'}
@@ -2247,12 +2454,10 @@ async function generateArticleBody({
 正文要求：
 ${bodyInstructions}
 
-输出语言：${outputLanguage === 'en' ? '仅英文，先产出中文底稿再翻译为英文' : outputLanguage === 'zh-en' ? '中英双语，当前这一步只产出中文底稿' : '仅中文'}
+输出语言：仅中文
 
 长度控制：
 ${lengthGuidance}
-- 每段都必须以中文为主，不得出现连续 8 个以上英文单词
-- 不要输出推理过程、注释或额外说明
 
 ${companyContext}
 
@@ -2286,26 +2491,43 @@ ${companyContext}
   }
 }
 
-async function translateArticleBodyToEnglish({
+async function generateEnglishArticleBody({
   settings,
   direction,
   keyword,
+  company,
+  product,
+  template,
   selectedTitle,
-  bodyZh,
-  bodyPrompt,
 }: {
   settings: ReturnType<typeof getSettings>
   direction: string
   keyword: string
+  company: ReturnType<typeof getCompanyProfile>
+  product: Product | null
+  template: PromptTemplate | null
   selectedTitle: { zh: string; en: string }
-  bodyZh: string
-  bodyPrompt: string
 }) {
-  const hasExplicitLength = /(\d{2,4})\s*(字|字符|字数|tokens?|token|words?|单词)|至少\s*\d{2,4}|不少于\s*\d{2,4}|\d{2,4}\s*[-~至到]\s*\d{2,4}/i.test(
-    bodyPrompt,
-  )
+  const companyRawExcerpt = company.rawContent.replace(/\s+/g, ' ').slice(0, 360)
+  const bodyInstructions = template?.includeCompanyProfile
+    ? `${template?.bodyPrompt || '写完整的 SEO 正文'}
+
+生成的文章中要自然融入公司优势信息，公司介绍如下：${companyRawExcerpt || '暂无原始公司资料'}`
+    : template?.bodyPrompt || '写完整的 SEO 正文'
+  const companyContext = template?.includeCompanyProfile
+    ? `
+Company profile:
+- Strengths: ${company.strengths.join(' / ') || 'N/A'}
+- Tone: ${company.tone || 'Professional'}
+- Scenarios: ${company.scenarios.join(' / ') || 'N/A'}
+`
+    : ''
+  const lengthGuidance = buildBodyLengthGuidance(template?.bodyPrompt || '', 'en')
+
   const prompt = `
-你现在只负责把中文 SEO 正文转成自然、专业、可读的英文，不要输出 TDK，不要输出中文，不要输出解释。
+You only need to output the English body.
+Do not output TDK, Chinese, or explanations.
+Start the body with the conclusion, answer, recommendation, or core judgment, then expand.
 
 文案方向：${direction}
 关键词：${keyword || '未指定'}
@@ -2313,13 +2535,52 @@ async function translateArticleBodyToEnglish({
 - 中文：${selectedTitle.zh}
 - 英文：${selectedTitle.en}
 
-翻译要求：
-- 保持原文结构和段落数量
-- 用自然英文改写，不要逐字硬翻
-- 保留 SEO 可读性和专业语气
-- 开头先给出答案、结果、推荐结论或核心判断，再展开细节
-- ${hasExplicitLength ? '若原中文正文已按正文要求控制长度，请保持与原文相近的信息密度和篇幅，但不要无意义扩写' : '若正文要求未明确写长度，请按适合 SEO/GEO 的英文长文输出，目标约 500-1000 tokens'}
-- 英文 TDK 要自然，不要直接照搬中文语序
+正文要求：
+${bodyInstructions}
+
+长度控制：
+${lengthGuidance}
+
+${companyContext}
+
+Product information:
+- Product name: ${product?.name || 'Not specified'}
+- Product details: ${product?.content.slice(0, 360) || 'Not specified'}
+- Product keywords: ${product?.keywords.join(' / ') || 'N/A'}
+- Product scenarios: ${product?.scenarios.join(' / ') || 'N/A'}
+
+请严格按以下标签输出，不要输出其他说明：
+[BODY_EN]
+English body with paragraph breaks
+[/BODY_EN]
+`
+
+  const raw = await llmRequest({
+    settings,
+    prompt,
+    timeoutMs: settings.englishTimeoutSec * 1000,
+    maxTokens: 1800,
+  })
+  const bodyEn = extractTaggedBlock(raw, 'BODY_EN')?.trim()
+
+  if (!bodyEn) {
+    throw new Error('英文正文生成失败：模型返回内容未能解析为有效的英文正文。')
+  }
+
+  return bodyEn
+}
+
+async function translateArticleBodyToEnglish({
+  settings,
+  bodyZh,
+}: {
+  settings: ReturnType<typeof getSettings>
+  bodyZh: string
+}) {
+  const targetMaxTokens = Math.max(700, Math.min(1400, Math.ceil(bodyZh.length * 0.72)))
+  const prompt = `
+把下面的中文正文直接翻译成英文。
+只输出英文正文，不要输出 TDK，不要输出中文，不要输出解释。
 
 中文正文：
 ${bodyZh}
@@ -2334,7 +2595,7 @@ English body with paragraph breaks
     settings,
     prompt,
     timeoutMs: settings.englishTimeoutSec * 1000,
-    maxTokens: 1800,
+    maxTokens: targetMaxTokens,
   })
   const bodyEn = extractTaggedBlock(raw, 'BODY_EN')
 
@@ -2344,6 +2605,170 @@ English body with paragraph breaks
   return bodyEn
 }
 
+async function translateArticleBodyToChinese({
+  settings,
+  bodyEn,
+}: {
+  settings: ReturnType<typeof getSettings>
+  bodyEn: string
+}) {
+  const englishWordCount = bodyEn.trim().split(/\s+/).filter(Boolean).length
+  const targetMaxTokens = Math.max(900, Math.min(1900, Math.ceil(englishWordCount * 1.8)))
+  const prompt = `
+把下面的英文正文直接翻译成中文。
+只输出中文正文，不要输出英文，不要输出 TDK，不要输出解释。
+
+英文正文：
+${bodyEn}
+
+请严格按以下标签输出，不要输出其他说明：
+[BODY_ZH]
+中文正文，使用换行分段
+[/BODY_ZH]
+`
+
+  const raw = await llmRequest({
+    settings,
+    prompt,
+    timeoutMs: settings.englishTimeoutSec * 1000,
+    maxTokens: targetMaxTokens,
+  })
+  const rawBodyZh = extractTaggedBlock(raw, 'BODY_ZH')
+  const bodyZh = rawBodyZh ? normalizeChineseBodyOutput(rawBodyZh) : ''
+
+  if (!bodyZh) {
+    throw new Error('中文翻译失败：模型返回内容未能解析为有效的中文正文。')
+  }
+
+  return bodyZh
+}
+
+async function translateChineseTdkToEnglish({
+  settings,
+  titleZh,
+  descriptionZh,
+  keywordsZh,
+}: {
+  settings: ReturnType<typeof getSettings>
+  titleZh: string
+  descriptionZh: string
+  keywordsZh: string
+}) {
+  if (!titleZh.trim() && !descriptionZh.trim() && !keywordsZh.trim()) {
+    return {
+      titleEn: '',
+      descriptionEn: '',
+      keywordsEn: '',
+    }
+  }
+
+  const prompt = `
+把下面的中文 TDK 直接翻译成英文。
+不要输出解释。
+
+中文 TDK：
+[TDK_TITLE_ZH]
+${titleZh}
+[/TDK_TITLE_ZH]
+[TDK_DESCRIPTION_ZH]
+${descriptionZh}
+[/TDK_DESCRIPTION_ZH]
+[TDK_KEYWORDS_ZH]
+${keywordsZh}
+[/TDK_KEYWORDS_ZH]
+
+输出要求：
+- 直接翻译 Title、Description、Keywords
+
+请严格按以下标签输出，不要输出其他说明：
+[TDK_TITLE_EN]
+English Title
+[/TDK_TITLE_EN]
+[TDK_DESCRIPTION_EN]
+English Description
+[/TDK_DESCRIPTION_EN]
+[TDK_KEYWORDS_EN]
+English keywords, comma separated
+[/TDK_KEYWORDS_EN]
+`
+
+  const raw = await llmRequest({
+    settings,
+    prompt,
+    timeoutMs: settings.englishTimeoutSec * 1000,
+    maxTokens: 240,
+  })
+
+  return {
+    titleEn: extractTaggedBlock(raw, 'TDK_TITLE_EN'),
+    descriptionEn: extractTaggedBlock(raw, 'TDK_DESCRIPTION_EN'),
+    keywordsEn: extractTaggedBlock(raw, 'TDK_KEYWORDS_EN'),
+  }
+}
+
+async function translateEnglishTdkToChinese({
+  settings,
+  titleEn,
+  descriptionEn,
+  keywordsEn,
+}: {
+  settings: ReturnType<typeof getSettings>
+  titleEn: string
+  descriptionEn: string
+  keywordsEn: string
+}) {
+  if (!titleEn.trim() && !descriptionEn.trim() && !keywordsEn.trim()) {
+    return {
+      titleZh: '',
+      descriptionZh: '',
+      keywordsZh: '',
+    }
+  }
+
+  const prompt = `
+把下面的英文 TDK 直接翻译成中文。
+不要输出解释。
+
+英文 TDK：
+[TDK_TITLE_EN]
+${titleEn}
+[/TDK_TITLE_EN]
+[TDK_DESCRIPTION_EN]
+${descriptionEn}
+[/TDK_DESCRIPTION_EN]
+[TDK_KEYWORDS_EN]
+${keywordsEn}
+[/TDK_KEYWORDS_EN]
+
+输出要求：
+- 直接翻译 Title、Description、Keywords
+
+请严格按以下标签输出，不要输出其他说明：
+[TDK_TITLE_ZH]
+中文Title
+[/TDK_TITLE_ZH]
+[TDK_DESCRIPTION_ZH]
+中文Description
+[/TDK_DESCRIPTION_ZH]
+[TDK_KEYWORDS_ZH]
+中文关键词，逗号分隔
+[/TDK_KEYWORDS_ZH]
+`
+
+  const raw = await llmRequest({
+    settings,
+    prompt,
+    timeoutMs: settings.englishTimeoutSec * 1000,
+    maxTokens: 240,
+  })
+
+  return {
+    titleZh: extractTaggedBlock(raw, 'TDK_TITLE_ZH'),
+    descriptionZh: extractTaggedBlock(raw, 'TDK_DESCRIPTION_ZH'),
+    keywordsZh: extractTaggedBlock(raw, 'TDK_KEYWORDS_ZH'),
+  }
+}
+
 async function generateEnglishTdk({
   settings,
   direction,
@@ -2351,7 +2776,7 @@ async function generateEnglishTdk({
   selectedTitle,
   bodyZh,
   bodyEn,
-  zhTdk,
+  template,
 }: {
   settings: ReturnType<typeof getSettings>
   direction: string
@@ -2359,10 +2784,11 @@ async function generateEnglishTdk({
   selectedTitle: { zh: string; en: string }
   bodyZh: string
   bodyEn: string
-  zhTdk: { titleZh: string; descriptionZh: string; keywordsZh: string }
+  template: PromptTemplate | null
 }) {
   const prompt = `
-You only need to generate English TDK from the existing article body and title. Do not rewrite the body. Do not output Chinese. Do not add explanations.
+You only need to generate English TDK from the existing article body and title.
+Do not rewrite the body. Do not output Chinese. Do not add explanations.
 
 Direction: ${direction}
 Keyword: ${keyword || 'Not specified'}
@@ -2376,15 +2802,8 @@ ${bodyEn || 'No English body available.'}
 Chinese body reference:
 ${bodyZh}
 
-Chinese TDK reference:
-- Title: ${zhTdk.titleZh || 'N/A'}
-- Description: ${zhTdk.descriptionZh || 'N/A'}
-- Keywords: ${zhTdk.keywordsZh || 'N/A'}
-
-Requirements:
-- Keep it natural, professional, and SEO-readable
-- Title and Description must match the article intent
-- Keywords should stay concise and comma-separated
+User TDK requirements:
+${template?.tdkPrompt || 'Generate English TDK'}
 
 Return only these tags:
 [TDK_TITLE_EN]
@@ -2402,7 +2821,7 @@ English keywords, comma separated
     settings,
     prompt,
     timeoutMs: settings.englishTimeoutSec * 1000,
-    maxTokens: 320,
+    maxTokens: 220,
   })
 
   const titleEn = extractTaggedBlock(raw, 'TDK_TITLE_EN')
@@ -2422,7 +2841,7 @@ English keywords, comma separated
 
 async function exportHistory(historyId: number, format: 'md' | 'docx') {
   const record = getHistoryById(historyId)
-  const outputLanguage = resolveOutputLanguage(record.meta.outputLanguage)
+  const outputLanguage = resolveExportOutputLanguage(record)
   const settings = getSettings()
   const outputDir = settings.outputDir || DEFAULT_OUTPUT_DIR
   await fs.mkdir(outputDir, { recursive: true })
@@ -2442,7 +2861,7 @@ async function exportHistory(historyId: number, format: 'md' | 'docx') {
 }
 
 function renderMarkdown(record: HistoryRecord) {
-  const outputLanguage = resolveOutputLanguage(record.meta.outputLanguage)
+  const outputLanguage = resolveExportOutputLanguage(record)
   const sections = [`# ${outputLanguage === 'en' ? record.selectedTitleEn : record.selectedTitleZh}`]
 
   if (outputLanguage === 'zh-en') {
@@ -2457,31 +2876,46 @@ function renderMarkdown(record: HistoryRecord) {
     sections.push(`## English Body\n\n${record.bodyEn}`)
   }
 
-  const tdkLines = ['## TDK']
-  if (outputLanguage !== 'en') {
+  const tdkLines: string[] = []
+  if (outputLanguage !== 'en' && (record.tdkTitleZh.trim() || record.tdkDescriptionZh.trim() || record.tdkKeywordsZh.trim())) {
     tdkLines.push(`- Title (ZH): ${record.tdkTitleZh}`)
     tdkLines.push(`- Description (ZH): ${record.tdkDescriptionZh}`)
     tdkLines.push(`- Keywords (ZH): ${record.tdkKeywordsZh}`)
   }
-  if (outputLanguage !== 'zh') {
+  if (outputLanguage !== 'zh' && (record.tdkTitleEn.trim() || record.tdkDescriptionEn.trim() || record.tdkKeywordsEn.trim())) {
     tdkLines.push(`- Title (EN): ${record.tdkTitleEn}`)
     tdkLines.push(`- Description (EN): ${record.tdkDescriptionEn}`)
     tdkLines.push(`- Keywords (EN): ${record.tdkKeywordsEn}`)
   }
-  sections.push(tdkLines.join('\n'))
+  if (tdkLines.length) {
+    sections.push(['## TDK', ...tdkLines].join('\n'))
+  }
 
   return `${sections.join('\n\n')}\n`
 }
 
 function resolveOutputLanguage(value: unknown): OutputLanguage {
-  return value === 'zh' || value === 'en' || value === 'zh-en' ? value : 'zh-en'
+  return value === 'en' ? 'en' : 'zh'
+}
+
+function resolveExportOutputLanguage(record: HistoryRecord): ExportOutputLanguage {
+  const hasZh = Boolean(record.bodyZh.trim())
+  const hasEn = Boolean(record.bodyEn.trim())
+
+  if (hasZh && hasEn) {
+    return 'zh-en'
+  }
+  if (hasEn) {
+    return 'en'
+  }
+  return 'zh'
 }
 
 function sanitizeFileName(value: string) {
   return value.replace(/[\\/:*?"<>|]/g, '-').slice(0, 48)
 }
 
-async function exportDocxWithPython(record: HistoryRecord, outputLanguage: OutputLanguage, outputPath: string) {
+async function exportDocxWithPython(record: HistoryRecord, outputLanguage: ExportOutputLanguage, outputPath: string) {
   if (!existsSync(PYTHON_BIN)) {
     throw new Error('DOCX 导出环境缺失：找不到 .venv/bin/python，请先重新启动工具完成依赖初始化。')
   }
